@@ -13,6 +13,7 @@ pandas = "^2.2.3"
 jax = {extras = ["cuda12"], version = "^0.4.35"}
 matplotlib = "^3.9.3"
 einops = "^0.8.0"
+treescope = "^0.1.7"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

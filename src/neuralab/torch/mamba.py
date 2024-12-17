@@ -338,3 +338,4 @@ class RMSNorm(nn.Module):
 
         return output
         
+#[.w, .h, .d(r,g,b)] Real

@@ -9,6 +9,8 @@ from scipy.signal import cont2discrete
 from scipy import special as ss
 import matplotlib.pyplot as plt
 
+
+
 class HiPPO(nn.Module):
     """Linear time invariant x' = Ax + Bu."""
 
