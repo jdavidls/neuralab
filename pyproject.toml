@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "neuralab"
+version = "0.1.0"
+description = ""
+authors = ["J.David Luque <jdluque@leitat.org>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+flax = "^0.10.2"
+torch = {extras = ["cpu"], version = "^2.5.1"}
+pandas = "^2.2.3"
+jax = {extras = ["cuda12"], version = "^0.4.35"}
+matplotlib = "^3.9.3"
+einops = "^0.8.0"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
