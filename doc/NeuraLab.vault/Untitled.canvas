@@ -1,0 +1,11 @@
+{
+	"nodes":[
+		{"id":"ebdb64727fcaa570","x":-480,"y":-400,"width":180,"height":60,"color":"1","type":"text","text":"HiPPO Encoder"},
+		{"id":"589a7032fa9bd611","x":-260,"y":-300,"width":180,"height":60,"color":"1","type":"text","text":"FeedForward"},
+		{"id":"1c5e9ffe42886925","x":-40,"y":220,"width":200,"height":60,"color":"1","type":"text","text":"HiPPO Decoder"}
+	],
+	"edges":[
+		{"id":"2148cdfdca717ed0","fromNode":"ebdb64727fcaa570","fromSide":"bottom","toNode":"589a7032fa9bd611","toSide":"left"},
+		{"id":"952005aa1a3a4504","fromNode":"589a7032fa9bd611","fromSide":"right","toNode":"1c5e9ffe42886925","toSide":"top"}
+	]
+}

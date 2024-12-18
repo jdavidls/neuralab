@@ -732,6 +732,17 @@ numpy = ">=1.24"
 scipy = {version = ">=1.11.1", markers = "python_version >= \"3.12\""}
 
 [[package]]
+name = "jaxtyping"
+version = "0.2.36"
+description = "Type annotations and runtime checking for shape and dtype of JAX/NumPy/PyTorch/etc. arrays."
+optional = false
+python-versions = ">=3.9"
+files = [
+    {file = "jaxtyping-0.2.36-py3-none-any.whl", hash = "sha256:b19bcbd4009df8734602203402483a4066ad2eb3382904432e370588e9c9707d"},
+    {file = "jaxtyping-0.2.36.tar.gz", hash = "sha256:781ac44a3cf8982063d7ee48b5008ccfad7b13793bf878eb3058d5319aa08f0f"},
+]
+
+[[package]]
 name = "jedi"
 version = "0.19.2"
 description = "An autocompletion tool for Python that can be used for text editors."
@@ -2645,4 +2656,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "29a2db738dfb4f514eeffbd954fc81720548318521d97611636ab866466b9130"
+content-hash = "fcc7cceb50f52478613e880b3c7b6f547b693f7e1b88658b90d28ce0a785beb4"
