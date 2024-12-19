@@ -15,6 +15,9 @@ matplotlib = "^3.9.3"
 einops = "^0.8.0"
 treescope = "^0.1.7"
 jaxtyping = "^0.2.36"
+pyarrow = "^18.1.0"
+requests-toolbelt = "^1.0.0"
+atpbar = {extras = ["jupyter"], version = "^2.0.5"}
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

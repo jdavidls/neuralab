@@ -5,6 +5,9 @@ class TimeRange:
     start: DateTime
     stop: DateTime
 
+class Dataset:
+    ...
+
 class DataProxyClient:
     def __init__(self):
         ...
