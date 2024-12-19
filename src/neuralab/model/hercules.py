@@ -1,11 +1,9 @@
 #%%
 from einops import rearrange
 from flax import nnx
-
 from neuralab.nn.hippo import HiPPO
 
-
-class Hercules(nnx.Module):
+class H0(nnx.Module):
     '''
         Sin autoevaluacion
     '''

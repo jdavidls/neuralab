@@ -1,64 +1,108 @@
 # %%
-from typing import Callable, Optional
+from typing import Optional, Tuple
+from einops import repeat
 from jax import numpy as np
-from jax import nn, random
-from jax import jit
+from jax import random
 from jax import lax
-from numpy import stack
+from jax import nn
 from flax import nnx
-
+from math import pi as PI
 from jaxtyping import Float, Array
 
-EPS = 1e-5
-def ema_scan(input: Float[Array, "length"], decay: Float, *, state: Float = None):
-
-    def ema_step(x, value):
-        value = decay * value + (1 - decay) * x
-        return value, value
+def ema_scan(
+    x: Float[Array, "l ..."], 
+    decay: Float[Array, "emas"],
+    state: Optional[Float[Array, "... emas"]] = None,
+) -> Tuple[
+    Float[Array, "... emas"], 
+    Float[Array, "l ... emas"]
+]:
+    emas = len(decay)
 
     if state is None:
-        state = input[0]
+        state = repeat(x[0], "... -> ... emas", emas=emas) 
 
-    return lax.scan(ema_step, state, input)
+    print(state.shape)
 
+    def ema_step(ema_0, x_1):
 
-def uniform_decay(seed: nnx.Rngs):
-    def init():
-        return random.uniform(seed.params(), minval=EPS, maxval=1-EPS)
-    return init
+        ema_1 = decay * x_1 + (1 - decay) * ema_0
+
+        return ema_1, ema_1
+
+    return lax.scan(ema_step, state, x[..., None])
+
 
 class EMA(nnx.Module):
-    def __init__(self, init_decay: Float):
-        self.decay = nnx.Param(init_decay)
-        self.state = nnx.Variable(None)
+    def __init__(self, emas: int, rngs: nnx.Rngs):
+        self.log_decay: nnx.Param[Float[Array, "emas"]] = nnx.Param(
+            np.linspace(-PI, PI, emas)
+        )
+
+        self.state: nnx.Variable[Optional[Float[Array, "... emas"]]] = nnx.Variable(
+            None
+        )
+
+    @property
+    def decay(self):
+        return nn.sigmoid(self.log_decay.value)
+
+    def reset(self):
+        self.state.value = None
 
     def __call__(self, x):
-        decay = self.decay.value
-        state = self.state.value
 
-        state, result = ema_scan(x, decay, state=state)
-        self.state.value = state
-        return result
-    
-    @staticmethod
-    def stack(count: int):
-        @nnx.vmap
-        def stack_emas(decay):
-            return EMA(decay)
-        return stack_emas
+        ema_x_z, ema_x = ema_scan(
+            x, 
+            self.decay,
+            self.state.value
+        )
+
+        self.state.value = ema_x_z
+
+        return ema_x
+
+    def stats(self, x):
+
+        x2 = np.square(x)
+
+        emas = self(np.stack([x, x2], axis=1))
+
+        ema_x, ema_x2 = emas[:, 0], emas[:, 1]
+
+        # exponential standard deviation
+        esd = np.sqrt(ema_x2 - np.square(ema_x))
+
+        return ema_x, esd
+
+    def standarize(self, x):
+        ema_x, esd = self.stats(x)
+
+        return (x[..., None] - ema_x) / (esd + (1-self.decay))
 
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
+    EMAS = 4
     rngs = nnx.Rngs(3)
-    ema = EMA(0.5)
-    u = np.cumsum(random.normal(random.PRNGKey(3), (100,)))
-    y = ema(u)
+    ema = EMA(EMAS, rngs=rngs)
+    u = np.cumsum(random.normal(random.PRNGKey(3), (250,)))
+    ea, esd = ema.stats(u)
+    std = ema.standarize(u)
 
-    plt.plot(u, label="u")
-    plt.plot(y, label="y")
+    #plt.plot(u, label="u")
+    for n in range(EMAS):
+        plt.plot(ea[:, n], label=f"ema {ema.decay[n]:.2f}")
+    plt.legend()
+    plt.show()
+
+    for n in range(EMAS):
+        plt.plot(esd[:, n], label=f"esd {ema.decay[n]:.2f}")
+    plt.legend()
+    plt.show()
+
+    for n in range(EMAS):
+        plt.plot(std[:, n], label=f"std {ema.decay[n]:.2f}")
+    plt.legend()
+    plt.show()
+
 #%%
-nnx.vmap(EMA, in_axes=0, out_axes=0)([{
-    "decay": np.linspace(0, 1, 10),
-    "rngs": nnx.Rngs(3),
-}])
-# %%
