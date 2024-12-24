@@ -3,8 +3,6 @@
 from io import BytesIO
 from logging import getLogger as get_logger
 from pathlib import Path
-from random import sample
-from typing import Optional
 from zipfile import ZipFile
 
 import numpy as np
@@ -15,9 +13,15 @@ from dataproxy.loader import Loader
 from timeutils import Date, TimeDelta, TimeRange, millis
 
 DATAPROXY_STORAGE_PATH = Path.home() / '.dataproxy'
+DATAPROXY_DATA_SOURCE_PATH = DATAPROXY_STORAGE_PATH / 'data-source'
+DATAPROXY_CACHE_PATH = DATAPROXY_STORAGE_PATH / 'cache'
 
-BINANCE_STORAGE_PATH = DATAPROXY_STORAGE_PATH / 'binance'
-BINANCE_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+BINANCE_DATA_SOURCE_PATH = DATAPROXY_STORAGE_PATH / 'binance'
+BINANCE_DATA_SOURCE_PATH.mkdir(parents=True, exist_ok=True)
+
+BINANCE_SAMPLE_PATH = DATAPROXY_CACHE_PATH / 'binance'
+BINANCE_SAMPLE_PATH.mkdir(parents=True, exist_ok=True)
+
 
 
 COMPRESSION = 'gzip' # {‘snappy’, ‘gzip’, ‘brotli’, ‘lz4’, ‘zstd’}
@@ -38,18 +42,22 @@ _AGG_TRADE_COLUMN_DTYPE = {
 
 _AGG_TRADE_COLUMN_NAMES = list(_AGG_TRADE_COLUMN_DTYPE.keys())
 
-def _storage_path(date: Date, symbol: str):
-    return (BINANCE_STORAGE_PATH / symbol / date.isoformat()).with_suffix(f'.parquet.{COMPRESSION}')
+
+
 
 def _agg_trade_url(date: Date, symbol: str):
     return f"https://data.binance.vision/data/spot/daily/aggTrades/{symbol}/{symbol}-aggTrades-{date}.zip"
 
 def fetch_trade_dataframe(time_range: TimeRange, symbol: str):
-    with Loader.pool(f"Fetching {symbol} @ {time_range}", max_workers=8) as loader:
+
+    def _data_source_path(date: Date, symbol: str):
+        return (BINANCE_DATA_SOURCE_PATH / symbol / date.isoformat()).with_suffix(f'.parquet.{COMPRESSION}')
+
+    with Loader.pool(f"{symbol} @ {time_range}", max_workers=8) as loader:
         for dt in time_range.dates():
             @loader.task(dt)
             def task(dt):
-                storage_path = _storage_path(dt, symbol)
+                storage_path = _data_source_path(dt, symbol)
 
                 if storage_path.exists():
                     return pd.read_parquet(storage_path)
@@ -57,8 +65,9 @@ def fetch_trade_dataframe(time_range: TimeRange, symbol: str):
                 url = _agg_trade_url(dt, symbol)
                 content = loader.download(url)
 
-                with ZipFile(BytesIO(content)) as zip_file:
-                    try:
+                try:
+                    with ZipFile(BytesIO(content)) as zip_file:
+
                         with zip_file.open(f"{symbol}-aggTrades-{dt}.csv") as csv:
                             df = pd.read_csv(
                                 csv, 
@@ -66,22 +75,39 @@ def fetch_trade_dataframe(time_range: TimeRange, symbol: str):
                                 dtype=_AGG_TRADE_COLUMN_DTYPE,
                                 index_col="id"
                             )
-                    except:
-                        print(zip_file.namelist(), dt, url)
-                        raise
+                except Exception as e:
+                    e.add_note(f"Failed to read {url}")
+                    raise
 
                 df = df[["time", "price", "qty", "is_bid"]]
 
                 storage_path.parent.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(storage_path, compression='gzip')
+                df.to_parquet(storage_path, compression=COMPRESSION)
 
                 return df
 
     return pd.concat(loader.results)
 
+def fetch_sample_dataframe(time_range: TimeRange, symbol: str):
+    def _cache_path(symbol: str, time_range: TimeRange):
+        return (BINANCE_SAMPLE_PATH / symbol / f'{str(time_range)}').with_suffix(f'.parquet.{COMPRESSION}')
+    
+    cache_path = _cache_path(symbol, time_range)
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+    
+    tdf = fetch_trade_dataframe(time_range, symbol)
+    sdf = sample_trade_dataframe(tdf, time_range)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    sdf.to_parquet(cache_path, compression=COMPRESSION)
+
+    return sdf
+
+
 #%%
 
-def process_sample_dataframe(
+def sample_trade_dataframe(
     df: pd.DataFrame, 
     time_range: TimeRange, 
 ):   
@@ -173,7 +199,7 @@ if __name__ == '__main__':
 
     tdf = fetch_trade_dataframe(tr, "ETHUSDT")
     #%%
-    sdf = process_sample_dataframe(tdf, tr)
+    sdf = sample_trade_dataframe(tdf, tr)
     #%%
     from matplotlib import pyplot as plt
     
@@ -181,8 +207,8 @@ if __name__ == '__main__':
     plt.plot(sdf_['vwap'], label='vwap')
     plt.plot(sdf_['high'], label='high')
     plt.plot(sdf_['low'], label='low')
-    plt.plot(sdf_['bid_vwap'], label='bid_vwap')
-    plt.plot(sdf_['ask_vwap'], label='ask_vwap')
+    # plt.plot(sdf_['bid_vwap'], label='bid_vwap')
+    # plt.plot(sdf_['ask_vwap'], label='ask_vwap')
     plt.legend()
     plt.show()
     #%%

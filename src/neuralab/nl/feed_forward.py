@@ -30,3 +30,6 @@ class FeedForward(nnx.Module):
         x = self.activation(x)
         x = self.decoder(x)
         return x
+
+
+# nnx.LayerNorm with groups...

@@ -28,7 +28,7 @@ from flax import nnx
 from einops import rearrange, repeat, einsum
 from jaxtyping import Float, Array
 
-from neuralab.nn.hippo import make_hippo
+from neuralab.nl.hippo import make_hippo
 
 
 T = TypeVar('T')

@@ -18,6 +18,7 @@ jaxtyping = "^0.2.36"
 pyarrow = "^18.1.0"
 requests-toolbelt = "^1.0.0"
 atpbar = {extras = ["jupyter"], version = "^2.0.5"}
+hmmlearn = "^0.3.3"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

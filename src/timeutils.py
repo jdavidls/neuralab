@@ -5,6 +5,7 @@ from datetime import datetime as DateTime
 from datetime import time as Time
 from datetime import timedelta as TimeDelta
 from datetime import timezone as TimeZone
+from networkx import weakly_connected_components
 import numpy as np
 
 type TimeDeltaParseable = int | str | TimeDelta
@@ -30,11 +31,38 @@ def millis(time: Date | DateTime | TimeDelta | int) -> int:
 _1_DAY = TimeDelta(days=1)
 _1_DAY_MS = millis(_1_DAY)
 
+def _format_timedelta(time_delta: TimeDelta):
+
+    weeks, days = divmod(time_delta.days, 7)
+    hours, seconds = divmod(time_delta.seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+
+    parts = []
+    if weeks:
+        parts.append(f'{weeks}w')
+    if days:
+        parts.append(f'{days}d')
+    if hours:
+        parts.append(f'{hours}h')
+    if minutes:
+        parts.append(f'{minutes}m')
+    if seconds:
+        parts.append(f'{seconds}s')
+
+    return ''.join(parts)        
+
 @dataclass
 class TimeRange:
     start: DateTime
     stop: DateTime
-    step: TimeDelta
+    step: TimeDelta = _1_DAY
+
+    def __str__(self):
+        return (
+            f'since {self.start.isoformat()}'
+            f' to {self.stop.isoformat()}'
+            f' every {_format_timedelta(self.step)}'
+        )
 
     def __len__(self):
         return int((self.stop - self.start) // self.step)
@@ -82,8 +110,8 @@ class TimeRange:
         return TimeRange(self.start, self.stop, step)
 
     @classmethod
-    def of(cls, start: DateTimeParseable, stop: DateTimeParseable, step: TimeDelta):
-        return cls(parse_datetime(start), parse_datetime(stop), step)
+    def of(cls, start: DateTimeParseable, stop: DateTimeParseable, step: TimeDeltaParseable):
+        return cls(parse_datetime(start), parse_datetime(stop), parse_timedelta(step))
 
 # @dataclass
 # class DateRange:
