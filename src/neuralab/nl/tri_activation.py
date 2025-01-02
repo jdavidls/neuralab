@@ -11,7 +11,7 @@ from neuralab.utils import optional
 
 
 @jit
-def tri_activation(
+def triact(
     x: Float[Array, "..."],
     *,
     apply_square: bool = True,
@@ -76,14 +76,14 @@ class TriactFeed(nnx.Module):
         self.out_proj = nnx.Linear(in_features*3, out_features, rngs=rngs)
         
     def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
-        return self.out_proj(tri_activation(x * self.scale))
+        return self.out_proj(triact(x * self.scale))
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt  # Import here for better organization
 
     x = np.linspace(-1, 1, 101)
 
-    n, z, p = tri_activation(x, stack_outputs=None)
+    n, z, p = triact(x, stack_outputs=None)
 
 
     plt.plot(x, n, label="$n = relu(-\\tanh(\\pi x))^2$")

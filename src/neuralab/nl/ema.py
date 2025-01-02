@@ -1,5 +1,4 @@
 # %%
-from math import pi as PI
 from typing import Optional, Tuple
 
 from einops import repeat
@@ -12,10 +11,12 @@ from jaxtyping import Array, Float
 from neuralab.nl.common import State
 
 
-def ema_scan(
+def ema_fn(
     x: Float[Array, "l ..."],
     decay: Float[Array, "emas"],
-    state: Optional[Float[Array, "... emas"]] = None,
+    init: Optional[Float[Array, "... emas"]] = None,
+    *,
+    is_stationary=False,
 ) -> Tuple[
     Float[Array, "... emas"],
     Float[Array, "l ... emas"],
@@ -57,14 +58,19 @@ def ema_scan(
     """
     emas = len(decay)
 
-    if state is None:
-        state = repeat(x[0], "... -> ... emas", emas=emas)
+    if init is None:  # TODO: si el canal es estacionario el estado inicial debe ser 0
+        init = x[0]
+        if is_stationary:
+            init = np.zeros_like(init)
+        init = repeat(init, "... -> ... emas", emas=emas)
 
     def ema_step(ema_0, x_1):
         ema_1 = decay * x_1 + (1 - decay) * ema_0
         return ema_1, ema_1
 
-    return lax.scan(ema_step, state, x[..., None])
+    ema_z, ema = lax.scan(ema_step, init, x[..., None])
+
+    return ema_z, ema
 
 
 class EMA(nnx.Module):
@@ -83,11 +89,9 @@ class EMA(nnx.Module):
 
     def __init__(self, emas: int, rngs: nnx.Rngs):
         self.log_decay: nnx.Param[Float[Array, "emas"]] = nnx.Param(
-            np.linspace(-PI, PI, emas)
+            np.linspace(-np.pi, np.pi, emas)
         )
-        self.state: State[
-            Optional[Float[Array, "... emas"]]
-        ] = State(None)
+        self.state: State[Optional[Float[Array, "... emas"]]] = State(None)
 
     @property
     def decay(self):
@@ -98,7 +102,7 @@ class EMA(nnx.Module):
         """Resets the internal EMA state."""
         self.state.value = None
 
-    def __call__(self, x):
+    def __call__(self, x, is_stationary=False):
         """Computes EMAs for the given input.
 
         Args:
@@ -107,11 +111,13 @@ class EMA(nnx.Module):
         Returns:
             Array of computed EMAs.
         """
-        ema_x_z, ema_x = ema_scan(x, self.decay, self.state.value)
+        ema_x_z, ema_x = ema_fn(
+            x, self.decay, self.state.value, is_stationary=is_stationary
+        )
         # self.state.value = ema_x_z
         return ema_x
 
-    def stats(self, x):
+    def emasd(self, x, eps=1e-6, is_stationary=False):
         """Computes EMA and Exponential Standard Deviation (ESD).
 
         Args:
@@ -121,15 +127,34 @@ class EMA(nnx.Module):
             Tuple containing the EMA and ESD.
         """
         x2 = np.square(x)
-        emas = self(np.stack([x, x2], axis=1))
-        ema_x, ema_x2 = emas[:, 0], emas[:, 1]
+        emas = self(np.stack([x, x2], axis=1), is_stationary=is_stationary)
+        ema, ema_x2 = emas[:, 0], emas[:, 1]
+        
 
         # Exponential standard deviation
-        esd = np.sqrt(1e-4 + ema_x2 - np.square(ema_x))
+        esd = np.sqrt(eps + ema_x2 - np.square(ema))
 
-        return ema_x, esd
+        return ema, esd
+    
+    def emav(self, x, eps=1e-6, is_stationary=False):
+        """Computes the exponential moving average and variance of the input.
 
-    def standarize(self, x):
+        Args:
+            x: Input array.
+
+        Returns:
+            Tuple containing the EMA and EMV.
+        """
+        x2 = np.square(x)
+        emas = self(np.stack([x, x2], axis=1), is_stationary=is_stationary)
+        ema, ema_x2 = emas[:, 0], emas[:, 1]
+
+        # Exponential moving variance
+        emv = eps + ema_x2 - np.square(ema)
+
+        return ema, emv
+
+    def standarize(self, x, eps=1e-6, is_stationary=False):
         """Standardizes the input using EMA and ESD.
 
         Args:
@@ -148,11 +173,12 @@ class EMA(nnx.Module):
         The `(1 - α)` term in the denominator provides numerical stability,
         preventing division by zero when ESD is close to zero.
         """
-        ema_x, esd = self.stats(x)
+        ema, esd = self.emasd(x, eps=eps, is_stationary=is_stationary)
 
-        
         # Standarize the input
-        ema_normalized = (x[..., None] - ema_x + 1e-4) / (1e-4 + esd + (1 - self.decay))
+        # ema_normalized = (x[..., None] - ema + eps) / (eps + esd * (1+self.decay))
+        x = x[..., None]
+        ema_normalized = (x - ema) / (esd + eps + (1 - self.decay))
 
         return ema_normalized
 
@@ -160,26 +186,57 @@ class EMA(nnx.Module):
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
-    EMAS = 4
+    from dataproxy.dataset import DATASETS
+
+    L = 100
+    p = np.log(DATASETS[0]["vwap"].to_numpy())
+    u = np.log(DATASETS[0]["vol"].to_numpy())
+    v = (
+        np.log(DATASETS[0]["bid_vol"].to_numpy())
+        - np.log(DATASETS[0]["ask_vol"].to_numpy())
+    )
+
+    EMAS = 3
     rngs = nnx.Rngs(3)
     ema = EMA(EMAS, rngs=rngs)
-    u = np.cumsum(random.normal(random.PRNGKey(3), (250,)))
-    ea, esd = ema.stats(u)
-    std = ema.standarize(u)
+    # u = np.cumsum(random.normal(random.PRNGKey(3), (L,)))
+    u_ema, u_esd = ema.emasd(u)
+    u_ems = ema.standarize(u)
+
+    v_ema, v_esd = ema.emasd(v, is_stationary=True)
+    v_ems = ema.standarize(v, is_stationary=True)
 
     # plt.plot(u, label="u")
+    plt.title("Exponential Moving Average")
+    #plt.plot(u[:L], label=f"true")
     for n in range(EMAS):
-        plt.plot(ea[:, n], label=f"ema {ema.decay[n]:.2f}")
+        plt.plot(u_ema[:L, n], label=f"ema(u) {ema.decay[n]:.2f}")
+        plt.plot(v_ema[:L, n], label=f"ema(v) {ema.decay[n]:.2f}")
     plt.legend()
     plt.show()
 
+    plt.title("Exponential Standard Deviation")
     for n in range(EMAS):
-        plt.plot(esd[:, n], label=f"esd {ema.decay[n]:.2f}")
+        plt.plot(u_esd[:L, n], label=f"esd(u) {ema.decay[n]:.2f}")
+        plt.plot(v_esd[:L, n], label=f"esd(v) {ema.decay[n]:.2f}")
     plt.legend()
     plt.show()
 
+    plt.title("Exponential Moving Standarization")
     for n in range(EMAS):
-        plt.plot(std[:, n], label=f"std {ema.decay[n]:.2f}")
+        plt.plot(u_ems[:L, n], label=f"ems(u) {ema.decay[n]:.2f}")
+        plt.plot(v_ems[:L, n], label=f"ems(v) {ema.decay[n]:.2f}")
     plt.legend()
     plt.show()
 
+    # %%
+    from neuralab.nl import triact
+
+    # plt.plot(u_ems[:, 0])
+    plt.pcolormesh((triact(v_ems[:, 0]) * u_ems[:, 0, None]).T)
+    # plt.plot(np.log(p), label="u_ems")
+    plt.show()
+
+    #%%
+    plt.hist(u_ems[:, 1], bins=100)
+    plt.show()

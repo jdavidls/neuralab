@@ -1,32 +1,32 @@
 from itertools import pairwise
-import jax
-from jax import numpy as jnp, random
-from flax import nnx
 from typing import List, Tuple
+
+from flax import nnx
+from jax import nn
+from jax import numpy as jnp
+from jax import random
 
 
 class VAEEncoder(nnx.Module):
     features: List[int]
-    latent_dim: int
 
-    def __init__(self, features: List[int], latent_dim: int, rngs: nnx.Rngs):
+    def __init__(self, features: List[int], rngs: nnx.Rngs):
         super().__init__()
         self.features = features
-        self.latent_dim = latent_dim
 
         # Crear las capas densas del encoder
         self.layers = []
-        for in_features, out_features in pairwise(features):
+        for in_features, out_features in pairwise(features[:-1]):
             self.layers.append(nnx.Linear(in_features, out_features, rngs=rngs))
 
         # Capas para generar mu y log_var del espacio latente
-        self.mu = nnx.Linear(features[-1], latent_dim, rngs=rngs)
-        self.log_var = nnx.Linear(features[-1], latent_dim, rngs=rngs)
+        self.mu = nnx.Linear(features[-2], features[-1], rngs=rngs)
+        self.log_var = nnx.Linear(features[-2], features[-1], rngs=rngs)
 
     def __call__(self, x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         # Pasar por las capas densas con activación ReLU
         for layer in self.layers:
-            x = jax.nn.relu(layer(x))
+            x = nn.relu(layer(x))
 
         # Obtener mu y log_var
         mu = self.mu(x)
@@ -37,29 +37,28 @@ class VAEEncoder(nnx.Module):
 
 class VAEDecoder(nnx.Module):
     features: List[int]
-    output_dim: int
 
-    def __init__(self, features: List[int], output_dim: int, rngs: nnx.Rngs):
+    def __init__(self, features: List[int], rngs: nnx.Rngs):
         super().__init__()
         self.features = features
-        self.output_dim = output_dim
 
         # Crear las capas densas del decoder
         self.layers = []
-        for in_features, out_features in pairwise(features):
+        for in_features, out_features in pairwise(features[:-1]):
             self.layers.append(nnx.Linear(in_features, out_features, rngs=rngs))
 
         # Capa final para reconstruir la entrada
-        self.output_layer = nnx.Linear(features[-1],  output_dim, rngs=rngs)
+        self.output_layer = nnx.Linear(features[-2], features[-1], rngs=rngs)
 
     def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
         # Pasar por las capas densas con activación ReLU
         x = z
         for layer in self.layers:
-            x = jax.nn.relu(layer(x))
+            x = nn.relu(layer(x))
 
         # Capa final con activación sigmoid para reconstrucción
-        return jax.nn.sigmoid(self.output_layer(x))
+        # return jax.nn.sigmoid(self.output_layer(x))
+        return self.output_layer(x)
 
 
 class VAE(nnx.Module):
@@ -67,56 +66,55 @@ class VAE(nnx.Module):
     latent_dim: int
     input_dim: int
 
-    def __init__(self, features: List[int], latent_dim: int, input_dim: int, rngs: nnx.Rngs):
+    def __init__(self, features: List[int], rngs: nnx.Rngs):
         super().__init__()
         self.features = features
-        self.latent_dim = latent_dim
-        self.input_dim = input_dim
-
+        self.rngs = rngs
 
         # Inicializar encoder y decoder
-        self.encoder = VAEEncoder(features, latent_dim, rngs=rngs)
-        self.decoder = VAEDecoder(features[::-1], input_dim, rngs=rngs)
+        self.encoder = VAEEncoder(features, rngs=rngs)
+        self.decoder = VAEDecoder(features[::-1], rngs=rngs)
 
+    @staticmethod
     def reparameterize(
-        self, mu: jnp.ndarray, log_var: jnp.ndarray, key: nnx.RngStream
+        mu: jnp.ndarray,
+        log_var: jnp.ndarray,
+        rngs: nnx.Rngs,
     ) -> jnp.ndarray:
         std = jnp.exp(0.5 * log_var)
-        eps = random.normal(key(), std.shape)
+        eps = random.normal(rngs.vae(), std.shape)
         return mu + eps * std
 
-    def __call__(
-        self, x: jnp.ndarray, key: nnx.RngStream
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(self, x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # Codificar
         mu, log_var = self.encoder(x)
 
         # Reparametrizar
-        z = self.reparameterize(mu, log_var, key)
+        z = VAE.reparameterize(mu, log_var, self.rngs)
 
         # Decodificar
         reconstruction = self.decoder(z)
 
         return reconstruction, mu, log_var
 
+    @staticmethod
+    def kl_loss(mu: jnp.ndarray, log_var: jnp.ndarray) -> jnp.ndarray:
+        return -0.5 * jnp.sum(1 + log_var - jnp.square(mu) - jnp.exp(log_var))
 
-    def loss_function(
-        self,
-        x: jnp.ndarray,
-        reconstruction: jnp.ndarray,
-        mu: jnp.ndarray,
-        log_var: jnp.ndarray,
-    ) -> jnp.ndarray:
-        # Pérdida de reconstrucción (BCE)
-        recon_loss = -jnp.sum(
+    @staticmethod
+    def bce_loss(x: jnp.ndarray, reconstruction: jnp.ndarray) -> jnp.ndarray:
+        return -jnp.sum(
             x * jnp.log(reconstruction + 1e-10)
             + (1 - x) * jnp.log(1 - reconstruction + 1e-10)
         )
 
-        # Pérdida KL
-        kl_loss = -0.5 * jnp.sum(1 + log_var - jnp.square(mu) - jnp.exp(log_var))
+    @staticmethod
+    def se_loss(x: jnp.ndarray, reconstruction: jnp.ndarray) -> jnp.ndarray:
+        return jnp.sum(jnp.square(x - reconstruction))
 
-        return recon_loss + kl_loss
+    @staticmethod
+    def mse_loss(x: jnp.ndarray, reconstruction: jnp.ndarray) -> jnp.ndarray:
+        return jnp.mean(jnp.square(x - reconstruction))
 
 
 # # Función de entrenamiento para un paso
@@ -134,4 +132,3 @@ class VAE(nnx.Module):
 #     state = state.apply_gradients(grad)
 
 #     return state
-

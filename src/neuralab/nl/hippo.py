@@ -1,15 +1,13 @@
 # %%
 from typing import Optional, Tuple
 
-import jax
+
 from einops import einsum, rearrange, repeat
 from flax import nnx
-from jax import lax
-from jax import numpy as np
-from jax import random
+from jax import numpy as np, random, lax
 from jaxtyping import Array, Float
 
-from neuralab.nl.common import State
+#from neuralab.nl.common import State
 
 
 def make_hippo(N: int) -> Tuple[Float[Array, "N N"], Float[Array, "N 1"]]:
@@ -44,11 +42,11 @@ def hippo_scan(
     Float[Array, "... N"],
     Float[Array, "L ... N"],
 ]:
-
+    SHAPE = u.shape[1:]
     N = Ab.shape[0]
 
     if state is None:
-        state = np.zeros((N,))
+        state = np.zeros((*SHAPE, N,))
 
     #print(u.shape, Ab.shape, Bb.shape, state.shape)
 
@@ -59,7 +57,6 @@ def hippo_scan(
         return x1, x1
 
     return lax.scan(hippo_step, state, Bb_u)
-
 
 def hippo_encode(u, N: int, dt: Optional[float]=None):
     A, B = make_hippo(N)
@@ -141,8 +138,62 @@ def log_dt_initializer(hippos: int, *, dt_min=0.001, dt_max=0.1, rngs: nnx.Rngs)
         np.log(dt_max) - np.log(dt_min)
     ) + np.log(dt_min)
 
-
 class HiPPOEncoder(nnx.Module):
+    def __init__(
+        self,
+        out_features: int,
+        dt=0.01,
+        learn_transition: bool = False,
+        learn_dt: bool = False,
+    ):
+        self.out_features = out_features
+
+        A, B = make_hippo(out_features)
+
+        self.A = nnx.Param(A) if learn_transition else nnx.Cache(A)
+        self.B = nnx.Param(B) if learn_transition else nnx.Cache(B)
+
+        # self.log_dt = nnx.Param(
+        #     jax.random.uniform(rngs.next(), (hippos,))
+        #     * (np.log(dt_max) - np.log(dt_min))
+        #     + np.log(dt_min)
+        # )
+
+        dt = np.array([dt])
+        self.log_dt = nnx.Param(dt) if learn_dt else nnx.Cache(dt)
+
+        #self.state: State[Optional[Float[Array, "H N"]]] = State(None)
+
+    @property
+    def dt(self):
+        return self.log_dt.value
+
+    def __call__(self, u: Float[Array, "L"]) -> Float[Array, "L N"]:
+        Ab, Bb = discretize(self.A.value, self.B.value, self.dt)
+
+        state, x = hippo_scan(u, Ab, Bb)
+
+        #self.state.value = state
+
+        return x
+
+
+class HiPPODecoder(nnx.Module):
+
+    def __init__(self, in_features: int, length: int, dt: Optional[float] = None):
+        self.in_features = in_features
+        self.length = length
+        if dt is None:
+            dt = 1 / length
+        self.dt = dt
+
+        self.basis = nnx.Cache(hippo_basis(in_features, length, dt))
+
+    def __call__(self, x: Float[Array, "... N"]) -> Float[Array, "... L"]:
+        return einsum(self.basis.value, x, "L N, ... N -> ... L")
+    
+
+class HiPPOMultiEncoder(nnx.Module):
 
     def __init__(
         self,
@@ -181,9 +232,9 @@ class HiPPOEncoder(nnx.Module):
 
     @nnx.jit
     def __call__(self, u: Float[Array, "L "]) -> Float[Array, "L H N"]:
-        Ab, Bb = jax.vmap(discretize, in_axes=(0, 0, 0), out_axes=(0, 0))(self.A.value, self.B.value, self.dt)
+        Ab, Bb = nnx.vmap(discretize, in_axes=(0, 0, 0), out_axes=(0, 0))(self.A.value, self.B.value, self.dt)
 
-        state, x = jax.vmap(hippo_scan, in_axes=(None, 0, 0, 0), out_axes=(0, 1))(
+        state, x = nnx.vmap(hippo_scan, in_axes=(None, 0, 0, 0), out_axes=(0, 1))(
             u, Ab, Bb, self.state.value
         )
 
@@ -192,13 +243,6 @@ class HiPPOEncoder(nnx.Module):
         return x
 
 
-class HiPPODecoder(nnx.Module):
-
-    def __init__(self, in_features: int, length: int):
-        self.basis = nnx.Cache(hippo_basis(in_features, length, 1 / length))
-
-    def __call__(self, x: Float[Array, "... N"]) -> Float[Array, "... L"]:
-        return einsum(self.basis.value, x, "L N, ... N -> ... L")
 
 
 if __name__ == "__main__" and False:
@@ -214,8 +258,8 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     rngs = nnx.Rngs(3)
-    N, L, C = 32, 512, 2
-    u = np.cumsum(jax.random.normal(rngs.next(), (L,)), axis=0)
+    N, L = 32, 512
+    u = np.cumsum(random.normal(rngs.next(), (L,)), axis=0)
 
     enc = HiPPOEncoder(N, 4, dt_min=1 / L, rngs=rngs)
 
