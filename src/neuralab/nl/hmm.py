@@ -10,6 +10,8 @@ from jax import scipy as sp
 from jax.scipy import linalg
 from jaxtyping import Array, Float
 
+from neuralab.nl.common import Loss
+
 LOG_TAU = jnp.log(2 * jnp.pi)
 
 
@@ -102,6 +104,10 @@ def viterbi(
         weights = nn.softmax(log_probs, axis=0)
         log_delta_n = jnp.sum(weights * v_tmp, axis=0) + log_emission_n
 
+        # Normalization
+        #log_alpha_n = log_alpha_n - jnp.max(log_alpha_n)
+        #log_delta_n = log_delta_n - jnp.max(log_delta_n)
+
         return (log_alpha_n, log_delta_n), (log_alpha_n, log_delta_n)
 
     # Initialize
@@ -119,12 +125,21 @@ def viterbi(
     #log_alphas = jnp.concatenate([log_alpha_0[None], log_alphas], axis=0)
     log_deltas = jnp.concatenate([log_delta_0[None], log_deltas], axis=0)
 
+    return log_deltas, log_alpha_z
+
     # Get soft state assignments
     soft_paths = nn.softmax(log_deltas / temperature)
 
     loss = -jnp.sum(sp.special.logsumexp(log_alpha_z))
 
     return soft_paths, loss
+
+def viterbi_softpath(log_deltas: Float[Array, "T S"], temperature: float = 1.0) -> Float[Array, "T"]:
+    return nn.softmax(log_deltas / temperature)
+
+def viterbi_loss(log_alpha_z: Float[Array, "S"]) -> Float[Array, "()"]:
+    return -sp.special.logsumexp(log_alpha_z)
+
 
 
 class HMM(nnx.Module):
@@ -166,7 +181,13 @@ class HMM(nnx.Module):
 
     def __call__(self, obs, temperature: float = 1):
         log_emissions = self.log_emmissions(obs)
-        return viterbi(self.log_A, self.log_pi, log_emissions, temperature)
+
+        log_deltas, log_alpha_z = viterbi(self.log_A, self.log_pi, log_emissions, temperature)
+
+        if self.training:
+            self.loss = Loss(viterbi_loss(log_alpha_z))
+
+        return viterbi_softpath(log_deltas, temperature)
 
     @classmethod
     def stack(cls, num_layers, *args, **kwargs):
@@ -228,7 +249,6 @@ if __name__ == "__main__":
             states.append(jnp.array(state_seq))
             
         return jnp.stack(sequences), jnp.stack(states)
-    
 
     @nnx.jit
     def train_step(model, optimizer, sequences):
@@ -237,8 +257,8 @@ if __name__ == "__main__":
 
             @nnx.vmap
             def batch_loss(sequence):
-                _, loss = model(sequence)
-                return loss
+                model(sequence)
+                return Loss.collect(model)
 
             losses = batch_loss(sequences)  # [B]
             return jnp.mean(losses)
@@ -250,22 +270,18 @@ if __name__ == "__main__":
     # Training loop
     def train_hmm(model, optimizer, sequences, true_states, num_epochs=10000):
 
-        model.train(training=True)
-       
         for epoch in range(num_epochs):
+            model.train(training=True)
             loss = train_step(model, optimizer, sequences)
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.4f}")
 
             if epoch % 100 == 0:
                 eval_hmm(model, sequences[0], true_states[0])
-                model.train(training=True)
-
-
 
     def eval_hmm(model, test_sequence, true_states):
         model.eval(training=False)
-        predicted_states, _ = model(test_sequence)
+        predicted_states = model(test_sequence)
         
         # Convert true states to one-hot encoding
         true_states_onehot = nn.one_hot(true_states, num_states)  # [T,S]

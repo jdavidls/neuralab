@@ -6,7 +6,6 @@ def ema(
     x: Float[Array, "L ..."],
     decay: Float[Array, "()"],
     init: Optional[Float[Array, "..."]] = None,
-    non_stationary_mask: Optional[Array] = None,
 ) -> Float[Array, "L ..."]:
 
     """Efficiently computes Exponential Moving Averages (EMAs) using `lax.scan`.
@@ -50,8 +49,10 @@ def ema(
             init *= non_stationary_mask
         init = jnp.repeat(init, decay.shape[0], axis=-1)
 
+    alpha = 2 / (decay + 1)
+
     def ema_step(ema_0, x_1):
-        ema_1 = decay * x_1 + (1 - decay) * ema_0
+        ema_1 = alpha * x_1 + (1 - alpha) * ema_0
         return ema_1, ema_1
 
     _, result = lax.scan(ema_step, init, x[..., None])
