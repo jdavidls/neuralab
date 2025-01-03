@@ -9,7 +9,7 @@ from jax import random
 from jaxtyping import Array, Float
 
 from neuralab.nl.common import State
-
+from neuralab import fn
 
 def ema_fn(
     x: Float[Array, "l ..."],
@@ -87,16 +87,19 @@ class EMA(nnx.Module):
                updated during computation.
     """
 
-    def __init__(self, emas: int, rngs: nnx.Rngs):
-        self.log_decay: nnx.Param[Float[Array, "emas"]] = nnx.Param(
-            np.linspace(-np.pi, np.pi, emas)
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.training = False
+
+        self.log_decay: nnx.Param[Float[Array, "num_layers"]] = nnx.Param(
+            np.linspace(-np.pi, np.pi, num_layers)
         )
-        self.state: State[Optional[Float[Array, "... emas"]]] = State(None)
+        self.state: State[Optional[Float[Array, "... num_layers"]]] = State(None)
 
     @property
     def decay(self):
         """Returns the sigmoid-transformed decay values."""
-        return nn.sigmoid(self.log_decay.value)
+        return nn.sigmoid(self.log_decay.value)**2
 
     def reset(self):
         """Resets the internal EMA state."""
@@ -111,10 +114,17 @@ class EMA(nnx.Module):
         Returns:
             Array of computed EMAs.
         """
-        ema_x_z, ema_x = ema_fn(
-            x, self.decay, self.state.value, is_stationary=is_stationary
-        )
-        # self.state.value = ema_x_z
+
+        init = self.state.value
+        if init is None:  # TODO: si el canal es estacionario el estado inicial debe ser 0
+            init = x[0]
+            if is_stationary:
+                init = np.zeros_like(init)
+            init = repeat(init, "... -> ... l", l=self.num_layers)
+
+        ema_x = fn.ema(x, self.decay, init)
+        #if self.training is False:
+            #self.state.value = ema_x[-1]
         return ema_x
 
     def emasd(self, x, eps=1e-6, is_stationary=False):
@@ -198,7 +208,7 @@ if __name__ == "__main__":
 
     EMAS = 3
     rngs = nnx.Rngs(3)
-    ema = EMA(EMAS, rngs=rngs)
+    ema = EMA(EMAS)
     # u = np.cumsum(random.normal(random.PRNGKey(3), (L,)))
     u_ema, u_esd = ema.emasd(u)
     u_ems = ema.standarize(u)

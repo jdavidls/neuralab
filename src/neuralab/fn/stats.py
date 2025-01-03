@@ -1,11 +1,12 @@
 from typing import Optional
-from jax import numpy as jnp, typing, lax
+from jax import numpy as jnp, lax
 from jaxtyping import Array, Float
 
 def ema(
     x: Float[Array, "L ..."],
-    decay: float | Float[Array, "()"],
+    decay: Float[Array, "()"],
     init: Optional[Float[Array, "..."]] = None,
+    non_stationary_mask: Optional[Array] = None,
 ) -> Float[Array, "L ..."]:
 
     """Efficiently computes Exponential Moving Averages (EMAs) using `lax.scan`.
@@ -43,8 +44,11 @@ def ema(
         - xᵢ is the input value at time step i.
         - EMA₀ₖ is the initial EMA for decay rate αₖ.
     """
-    if init is None:  # TODO: si el canal es estacionario el estado inicial debe ser 0
+    if init is None:
         init = x[0]
+        if non_stationary_mask is not None:
+            init *= non_stationary_mask
+        init = jnp.repeat(init, decay.shape[0], axis=-1)
 
     def ema_step(ema_0, x_1):
         ema_1 = decay * x_1 + (1 - decay) * ema_0

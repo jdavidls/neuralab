@@ -23,7 +23,7 @@ Glossary:
 from typing import Annotated, Optional, TypeVar
 from typing_extensions import Doc
 import jax
-import jax.numpy as np
+from jax import numpy as jnp
 from flax import nnx
 from einops import rearrange, repeat, einsum
 from jaxtyping import Float, Array
@@ -90,13 +90,13 @@ class MambaMixer(nnx.Module):
             rngs=rngs
         )
 
-        #A = repeat(np.arange(1, d_state + 1), 'n -> d_in n', d_in=d_inner)
+        #A = repeat(jnp.arange(1, d_state + 1), 'n -> d_in n', d_in=d_inner)
         A, _ = make_hippo(d_state)[0]
-        A = repeat(np.diagonal(A), 'n -> d_in n', d_in=d_inner)
+        A = repeat(jnp.diagonal(A), 'n -> d_in n', d_in=d_inner)
 
-        self.A_log = nnx.Param(np.log(A))
+        self.A_log = nnx.Param(jnp.log(A))
 
-        self.D = nnx.Param(np.ones(d_inner))
+        self.D = nnx.Param(jnp.ones(d_inner))
 
         self.out_proj = nnx.Linear(
             d_inner, 
@@ -122,7 +122,7 @@ class MambaMixer(nnx.Module):
         """
         # (b, l, d) = x.shape
         
-        (x, res) = np.split(
+        (x, res) = jnp.split(
             self.in_proj(x),  # shape (b, l, 2 * d_in)
             2,
             axis=-1
@@ -165,7 +165,7 @@ class MambaMixer(nnx.Module):
         #     ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
         #                                  and is why Mamba is called **selective** state spaces)
         
-        A = -np.exp(self.A_log.float())  # shape (d_in, n)
+        A = -jnp.exp(self.A_log.float())  # shape (d_in, n)
 
         (Δ, B, C) = rearrange(self.x_proj(x), "l (dt_rank n m) -> l dt_rank, l n 1, l 1 m", dt_rank=self.dt_rank, n=n, m=n)
 
@@ -178,60 +178,46 @@ class MambaMixer(nnx.Module):
         return y
 
     
-def selective_scan(
-        u: Float[Array, "l d_in"],
-        delta: Float[Array, "l d_in"],
-        A: Float[Array, "d_in n"], 
-        B: Float[Array, "l n 1"], 
-        C: Float[Array, "l 1 n"], 
-        D: Float[Array, "d_in"]
-):
-    """Does selective scan algorithm. See:
-        - Section 2 State Space Models in the Mamba paper [1]
-        - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-        - run_SSM(A, B, C, u) in The Annotated S4 [2]
-
-    This is the classic discrete state space formula:
-        x(t + 1) = Ax(t) + Bu(t)
-        y(t)     = Cx(t) + Du(t)
-    except B and C (and the step size delta, which is used for discretization) are dependent on the input x(t).
-
-    Args:
-        u: shape (l, d_in)    
-        delta: shape (l, d_in)
-        A: shape (d_in, n)
-        B: shape (l, n, 1)
-        C: shape (l, 1, n)
-        D: shape (d_in,)
-        
-    Returns:
-        output: shape (l, d_in)
-
-    Official Implementation:
-        selective_scan_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L86
-        Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
-        
+def selective_scan(u, delta, A, B, C, D, dt_min=0.001, dt_max=0.1):
     """
-    #(d_in, n) = A.shape
+    Selective SSM scan with proper gating mechanism.
     
-    # Discretize continuous parameters (A, B)
-    # - A is discretized using zero-order hold (ZOH) discretization (see Section 2 Equation 4 in the Mamba paper [1])
-    # - B is discretized using a simplified Euler discretization instead of ZOH. From a discussion with authors:
-    #   "A is the more important term and the performance doesn't change much with the simplification on B"
-    ΔA = np.exp(einsum(delta, A, 'l d_in, d_in n -> l n d_in'))
-    ΔB_u = einsum(delta, B, u, 'l d_in, l n 1, l d_in -> l d_in n')
+    Args:
+        u: input, shape (batch, length, d_model)
+        delta: time delta, shape (batch, length, d_state)
+        A: state matrix, shape (d_state, d_inner)
+        B: input matrix, shape (d_state, d_inner)
+        C: output matrix, shape (d_inner, d_state)
+        D: skip connection, shape (d_model,)
+    """
+    # Clamp delta values
+    delta = jnp.clip(delta, dt_min, dt_max)
     
-    # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-    def step(x0, _): 
-        ΔA, ΔB_u, ΔC = _
-        x = ΔA @ x0 + ΔB_u
-        y = ΔC @ x
-        return x, y
+    # Discretize continuous parameters
+    ΔA = jnp.exp(jnp.einsum('b l d, d n -> b l n d', delta, A))
+    ΔB = jnp.einsum('b l d, d n, b l d -> b l d n', delta, B, u)
     
-    x0 = np.zeros_like(A) # (d_in, n)
-    _, y = jax.lax.scan(step, x0, (ΔA, ΔB_u, C))
+    # Selective scan with state handling
+    def step(carry, inputs):
+        x_prev = carry
+        ΔA_t, ΔB_t, C_t = inputs
+        
+        # State update
+        x_cur = jnp.einsum('n d, d -> n', ΔA_t, x_prev) + ΔB_t
+        # Output projection
+        y_t = jnp.einsum('d n, n -> d', C_t, x_cur)
+        
+        return x_cur, y_t
     
-    y = y + u * D
-
-    return y
+    # Initialize state
+    batch_size = u.shape[0]
+    x0 = jnp.zeros((batch_size, A.shape[-1]))
+    
+    # Run scan
+    _, y = jax.lax.scan(step, x0, (ΔA, ΔB, C))
+    
+    # Skip connection
+    out = y + jnp.einsum('b l d, d -> b l d', u, D)
+    
+    return out
 
