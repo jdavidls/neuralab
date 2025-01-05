@@ -98,3 +98,8 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.show()
 
+    #%%
+
+    #g = nnx.grad(lambda x: triact(x))(x)
+    #plt.plot(x, g[0], label="dn/dx")
+

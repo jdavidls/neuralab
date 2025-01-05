@@ -1,9 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from os import cpu_count
-from typing import Callable, Iterator, cast
+from typing import Callable, Iterator, Optional, cast
 from atpbar import atpbar, flushing
 from math import ceil
+from numpy import str_
 import requests
 
 # Iterable with associated length
@@ -36,36 +37,26 @@ class ResponseWrapper:
    
 
 class Loader:
-
-    def __init__(self, executor: ThreadPoolExecutor):
+    def __init__(self, executor: ThreadPoolExecutor, title: Optional[str] = None):
+        self.title=title
         self.thread_pool = executor
         self.futures = {}
 
-    def __enter__(self):
-        return self
+    def add_task(self, fn, *args, **kwargs):
+        fut = self.thread_pool.submit(fn, *args, **kwargs)
+        self.futures[fut] = None
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-    def task(self, *args, **kwargs):
-        def wrapper(fn: Callable):
-            fut = self.thread_pool.submit(fn, *args, **kwargs)
-            self.futures[fut] = None
-            return fn
-        return wrapper
-
-    def download(self, url) -> bytes:
+    def download(self, url, title: Optional[str] = None) -> bytes:
         return b"".join(
             data for data in atpbar(
                 ResponseWrapper(
                     requests.get(url, stream=True)
                 ), 
-                name=url
+                name=title
             )
         )
     
-    @property
-    def results(self):
+    def get_results(self):
         return list(self.futures.values())
 
     @classmethod
@@ -73,12 +64,19 @@ class Loader:
     def pool(cls, title: str, max_workers: int | None = cpu_count()):
         with flushing():
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                with Loader(executor) as downloader:
+                with Loader(executor, title=title) as downloader:
                     yield downloader
 
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        completed = IterableWithLength(as_completed(self.futures), len(self.futures))
 
-                completed = IterableWithLength(as_completed(downloader.futures), len(downloader.futures))
-                for future in atpbar(completed, name=title):
-                    if exc := future.exception():
-                        raise exc
-                    downloader.futures[future] = future.result()
+        for future in atpbar(completed, name=self.title):
+            if exc := future.exception():
+                raise exc
+            self.futures[future] = future.result()        
+
+        return False
+    

@@ -122,7 +122,7 @@ class EMA(nnx.Module):
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
-    from dataproxy.dataset import DATASETS
+    from neuralab.ds.dataset import DATASETS
 
     L = 500
     p = DATASETS[0].log_price[:L]

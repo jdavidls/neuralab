@@ -1,68 +1,93 @@
 # %%
+from math import prod
 import optax
-from einops import rearrange, repeat
-from flax import nnx
-from jax import lax
+from einops import rearrange
+from flax import nnx, struct
 from jax import numpy as jnp
-from jax import random
-from jaxtyping import Array, Float
 
-from dataproxy.dataset import Dataset
+from neuralab.ds.dataset import Dataset
 from neuralab import nl
-from neuralab.nl.common import Loss, Metric
 
 
 class H0(nnx.Module):
+
+    @struct.dataclass
+    class Params:
+        num_ema_layers: int = 4
+        ema_features: list[str] = struct.field(
+            default_factory=lambda: [
+                "log_volume",
+                "log_imbalance",
+                "diff_log_price",
+            ]
+        )
+        num_hmm_layers: int = 4
+        num_hmm_features: int = 3
+        num_hmm_states: int = 8
+
+        @property
+        def num_ema_features(self):
+            return len(self.ema_features)
+        
+        @property
+        def num_features(self):
+            return prod((self.num_hmm_layers, self.num_hmm_states))
+
     def __init__(
         self,
-        num_ema_layers=4,
-        ema_features=["log_volume", "log_volume_imbalance", "diff_log_price"],
-
-        num_hmm_layers=4,
-        num_hmm_features=3,
-        num_hmm_states=5,
+        params=Params(),
         *,
         rngs: nnx.Rngs,
     ):
-        self.training = False
-        self.num_ema_layers = num_ema_layers
-        self.ema_features = ema_features
-        self.num_ema_features = len(ema_features)
+        self.params = params
 
-        self.ema = nl.EMA(num_ema_layers)
+        self.ema = nl.EMA(params.num_ema_layers)
 
-
-        self.num_hmm_layers = num_hmm_layers
-        self.num_hmm_features = num_hmm_features
-
-        self.hmm_proj = nnx.Linear(
-            self.num_ema_layers * self.num_ema_features,
-            self.num_hmm_layers * self.num_hmm_features,
-            rngs = rngs
+        self.hmm = nl.HMM.stack(
+            params.num_hmm_layers,
+            params.num_hmm_states,
+            params.num_hmm_features,
+            rngs=rngs,
         )
 
-        self.hmm = nl.HMM.stack(num_hmm_layers, num_hmm_states, num_hmm_features, rngs=rngs)
+        self.mamba = nl.Mamba(
+            nl.Mamba.Params(
+                num_features=params.num_features,
+            ),
+            rngs=rngs,
+        )
 
-        self.hmm_loss = Loss(None)
+        self.mamba_norm = nnx.LayerNorm(params.num_features, rngs=rngs)
+
+        self.sim_proj = nnx.Linear(params.num_features, 1, rngs=rngs)
 
     def __call__(self, ds: Dataset):
-        x = jnp.stack(
-            [getattr(ds, feature) for feature in self.ema_features], axis=-1
-        )
+        x = ds.features(self.params.ema_features, axis=-1)  # [time, ..., feature]
 
-        x = self.ema.std(x)
-
-        #x = rearrange(x, "t f l -> t (f l)", f=self.num_ema_features, l=self.num_ema_layers)
-        #x = self.hmm_proj(x)
-        #x = rearrange(x, "t (f l) -> t f l", f=self.num_hmm_features, l=self.num_hmm_layers)
+        # EMA
+        x = self.ema.std(x)  # [time, market, ..., feature, ema_layer]
 
         # HMM
-        soft_paths = nnx.vmap(
-            lambda hmm, x: hmm(x), in_axes=(0, -1), out_axes=-1
-        )(self.hmm, x)
 
-        return soft_paths
-    
+        hmm_axes = nnx.StateAxes({nl.Loss: 1, ...: None})
+        @nnx.vmap(in_axes=(hmm_axes, 1), out_axes=1)
+        @nnx.vmap(in_axes=(0, -1), out_axes=-1)
+        def hmm_vmap(hmm, features):
+            return hmm(features)
+
+        s = hmm_vmap(self.hmm, x)
+
+        # flatten
+        x = rearrange(s, "t ... s l -> t ... (s l)")
+
+        # Mamba
+        x = self.mamba_norm(x + self.mamba(x))
+
+
+        # Sim
+        x = self.sim_proj(x)
+
+        return s, nnx.sigmoid(x)
 
 
 @nnx.jit
@@ -71,9 +96,13 @@ def train_step(model, optimizer, dataset):
 
     def loss_fn(model):
         # Forward pass
-        model(dataset)
+        _, weights = model(dataset)
+        print(weights.shape)
 
-        return Loss.collect(model), {}
+        sim_metrics = nl.sim(dataset.returns[..., None], weights, params=nl.SimParams())
+        sim_loss = nl.sim_loss(sim_metrics)
+
+        return sim_loss + nl.Loss.collect(model), sim_metrics
 
     (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
 
@@ -91,7 +120,7 @@ def train_h0(model, optimizer, datasets, num_epochs=10000, sli=slice(0, 40320 //
         loss, metrics = train_step(model, optimizer, dataset[sli])
 
         if epoch % 1 == 0:
-            print(f"Epoch {epoch}, Loss: {loss:.4f}")
+            print(f"Epoch {epoch}, Loss: {loss:.4f} {metrics}",)
 
         if epoch % 100 == 99:
             evaluate_h0(model, datasets[0][sli])
@@ -101,13 +130,13 @@ def train_h0(model, optimizer, datasets, num_epochs=10000, sli=slice(0, 40320 //
 def evaluate_h0(model, dataset):
     """Evaluate H0 model and visualize results"""
     model.eval(training=False)
-    soft_paths = model(dataset)
+    soft_paths, _ = model(dataset)
 
     # Plot HMM state probabilities
     plt.figure(figsize=(12, 4))
     plt.title("HMM State Probabilities")
     # plt.imshow(rearrange(soft_paths[start:end], "t s l -> (l s) t"), aspect='auto', cmap='viridis')
-    plt.pcolormesh(rearrange(soft_paths, "t s l -> (l s) t"), cmap="viridis")
+    plt.pcolormesh(rearrange(soft_paths, "t ... s l -> (... l s) t"), cmap="viridis")
     plt.xlabel("Time")
     plt.ylabel("State")
     plt.colorbar(label="State Probability")
@@ -119,7 +148,7 @@ def evaluate_h0(model, dataset):
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
     import optax
-    from dataproxy.dataset import DATASETS
+    from neuralab.ds.dataset import DATASETS
 
     rngs = nnx.Rngs(0)
 
@@ -129,7 +158,7 @@ if __name__ == "__main__":
     # evaluate_h0(model, DATASETS[0])    # Add this function at the bottom
 
     # Train model
-    #%%
+    # %%
     train_h0(model, optimizer, DATASETS, num_epochs=5000)
 
     # %%

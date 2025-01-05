@@ -1,5 +1,4 @@
 from typing import Callable, Optional
-from neuralab.nl.mamba import optional
 from flax import nnx
 from jaxtyping import Array, Float
 

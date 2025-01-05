@@ -1,223 +1,276 @@
-"""Simple, minimal implementation of Mamba in one file of PyTorch.
+"""Simple, minimal implementation of Mamba in JAX/Flax.
 
-Suggest reading the following before/while reading the code:
+Suggested reading:
     [1] Mamba: Linear-Time Sequence Modeling with Selective State Spaces (Albert Gu and Tri Dao)
         https://arxiv.org/abs/2312.00752
     [2] The Annotated S4 (Sasha Rush and Sidd Karamcheti)
         https://srush.github.io/annotated-s4
 
 Glossary:
-    b: batch size                       (`B` in Mamba paper [1] Algorithm 2)
-    l: sequence length                  (`L` in [1] Algorithm 2)
-    d or d_model: hidden dim
-    n or d_state: latent state dim      (`N` in [1] Algorithm 2)
-    expand: expansion factor            (`E` in [1] Section 3.4)
-    d_in or d_inner: d * expand         (`D` in [1] Algorithm 2)
-    A, B, C, D: state space parameters  (See any state space representation formula)
-                                        (B, C are input-dependent (aka selective, a key innovation in Mamba); A, D are not)
-    Δ or delta: input-dependent step size
-    dt_rank: rank of Δ                  (See [1] Section 3.6 "Parameterization of ∆")
+    l: sequence length                 (`L` in [1] Algorithm 2)
+    f or num_features: feature dim     (`D` in [1] Algorithm 2)
+    n or ssm_dim: state space dim      (`N` in [1] Algorithm 2)
+    e or expand: expansion factor      (`E` in [1] Section 3.4)
+    h or ssm_features: f * expand      (Hidden dimension)
+    dt_rank: rank of Δ projection      (See [1] Section 3.6)
 
+State Space Parameters:
+    A: state transition matrix         (n, n)
+    B: input projection matrix         (n, h)
+    C: output projection matrix        (h, n)
+    D: skip connection                 (h,)
+    Δ: input-dependent step size       (l, h)
+
+Note: B, C are input-dependent (selective) while A, D are static parameters
 """
 
-from typing import Annotated, Optional, TypeVar
-from typing_extensions import Doc
-import jax
+# %%
+from typing import Annotated, Callable
+
+from einops import einsum, rearrange, repeat
+from flax import nnx, struct
+from jax import lax
 from jax import numpy as jnp
-from flax import nnx
-from einops import rearrange, repeat, einsum
-from jaxtyping import Float, Array
-
-from neuralab.nl.hippo import make_hippo
+from jaxtyping import Array, Float
 
 
-T = TypeVar('T')
-def optional(value: Optional[T], default: T) -> T:
-    return default if value is None else value
+def selective_scan(
+    u: Float[Array, "l ... h"],
+    dt: Float[Array, "l ... h"],
+    A: Float[Array, "n n"],
+    B: Float[Array, "n h"],
+    C: Float[Array, "h n"],
+    D: Float[Array, "h"],
+    dt_min=0.001,
+    dt_max=0.1,
+):
+    """Selective SSM scan with proper gating mechanism.
 
-class MambaMixer(nnx.Module):
+    Args:
+        u: input sequences             (l, ..., h)
+        dt: time delta                 (l, ..., h)
+        A: state matrix               (n, n)
+        B: input matrix               (n, h)
+        C: output matrix              (h, n)
+        D: skip connection            (h,)
+        dt_min: minimum delta value
+        dt_max: maximum delta value
+
+    Returns:
+        output: transformed sequence   (l, ..., h)
+    """
+    batch_shape = u.shape[1:-1]
+
+    # Clamp delta values
+    dt = jnp.clip(dt, dt_min, dt_max)
+
+    # Discretize continuous parameters
+    ΔA = jnp.exp(einsum(dt, A, "l ... d, d n -> l ... d n"))
+    ΔB_u = einsum(dt, B, u, "l ... d, l ... n, l ... d -> l ... d n")
+
+    # Selective scan with state handling
+    def step(carry, inputs):
+        x_t_1 = carry
+        ΔA_t, ΔB_u_t, C_t = inputs
+
+        # State update
+
+        x_t = ΔA_t * x_t_1 + ΔB_u_t
+
+        # Output projection
+        y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
+
+        return x_t, y_t
+
+    # Initialize state
+    x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
+
+    # Run scan
+
+    _, y = lax.scan(step, x0, (ΔA, ΔB_u, C))
+
+    # Skip connection
+    return y + u * D
+
+
+class SSM(nnx.Module):
+    """State Space Model with selective mechanisms."""
+
     def __init__(
-            self, 
-            d_model:int, 
-            expand: Annotated[int, Doc("expansion factor, defaults to 2")] = 2,
-            d_state: Annotated[
-                int, 
-                Doc("size of the state space's state, defaults to 16")
-            ] = 16, 
-            *,
-            d_conv:int = 4,
-            d_inner:Annotated[Optional[int], Doc("inner hidden dim, defaults to expand * d_model")]=None,
-            dt_rank: Annotated[Optional[int], Doc("rank of Δ, defaults to d_model / d_state")] = None,
-            use_proj_bias: bool = False,
-            use_conv_bias: bool = True, 
-            rngs: nnx.Rngs
+        self,
+        features: Annotated[int, "H"],
+        state_dim: Annotated[int, "N"],
+        dt_rank: Annotated[int, "R"],
+        *,
+        rngs: nnx.Rngs,
     ):
-        """A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."""
-        self.d_state = d_state = optional(d_state, 16)
-        self.d_inner = d_inner = optional(d_inner, expand * d_model)
-        self.dt_rank = dt_rank = optional(dt_rank, d_model // d_state)
+        """Initialize SSM parameters.
 
-        self.in_proj = nnx.Linear(
-            d_model, 
-            d_inner * 2, 
-            use_bias=use_proj_bias, 
-            rngs=rngs
-        )
+        Args:
+            features: Hidden dimension (H)
+            state_dim: State space dimension (N)
+            dt_rank: Delta projection rank (R)
+        """
+        self.features = features
+        self.state_dim = state_dim
+        self.dt_rank = dt_rank
 
-        self.conv1d = nnx.Conv(
-            in_features=d_inner,
-            out_features=d_inner,
-            kernel_size=d_conv,
-            use_bias=use_conv_bias,
-            feature_group_count=expand,
-            padding="CAUSAL", 
-            rngs=rngs
-        )
+        A = repeat(jnp.arange(1, state_dim + 1), "N -> H N", H=features)
+        self.A_log: nnx.Param[Float[Array, "H N"]] = nnx.Param(jnp.log(A))
+
+        self.D: nnx.Param[Float[Array, "H"]] = nnx.Param(jnp.ones(features))
 
         # x_proj takes in `x` and outputs the input-specific Δ, B, C
-        self.x_proj = nnx.Linear(
-            d_inner, 
-            dt_rank + d_state * 2, 
-            use_bias=False, 
-            rngs=rngs
-        )
-        
-        # dt_proj projects Δ from dt_rank to d_in
-        self.dt_proj = nnx.Linear(
-            dt_rank, 
-            d_inner, 
-            use_bias=True, 
-            rngs=rngs
+        self.ssm_proj = nnx.Linear(
+            features, dt_rank + state_dim * 2, use_bias=False, rngs=rngs
         )
 
-        #A = repeat(jnp.arange(1, d_state + 1), 'n -> d_in n', d_in=d_inner)
-        A, _ = make_hippo(d_state)[0]
-        A = repeat(jnp.diagonal(A), 'n -> d_in n', d_in=d_inner)
+        # dt_proj projects Δ from dt_rank to h
+        self.dt_proj = nnx.Linear(dt_rank, features, use_bias=True, rngs=rngs)
 
-        self.A_log = nnx.Param(jnp.log(A))
-
-        self.D = nnx.Param(jnp.ones(d_inner))
-
-        self.out_proj = nnx.Linear(
-            d_inner, 
-            d_model, 
-            use_bias=use_proj_bias, 
-            rngs=rngs
-        )
-        
-
-    def __call__(self, x: Float[Array, "... l d"]) -> Float[Array, "... l d"]:
-        """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
-    
-        Args:
-            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, d_in, n...)
-    
-        Returns:
-            output: shape (b, l, d)
-        
-        Official Implementation:
-            class Mamba, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L119
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-            
-        """
-        # (b, l, d) = x.shape
-        
-        (x, res) = jnp.split(
-            self.in_proj(x),  # shape (b, l, 2 * d_in)
-            2,
-            axis=-1
-        )
-
-        #x = rearrange(x, 'b l d_in -> b d_in l')
-        x = self.conv1d(x)#[:, :, :l]
-        #x = rearrange(x, 'b d_in l -> b l d_in')
-        
-        x = nnx.silu(x)
-
-        y = self.ssm(x)
-        
-        y = y * nnx.silu(res)
-        
-        output = self.out_proj(y)
-
-        return output
-
-    
-    def ssm(self, x):
+    def __call__(self, u: Float[Array, "T ... H"]) -> Float[Array, "T ... H"]:
         """Runs the SSM. See:
             - Algorithm 2 in Section 3.2 in the Mamba paper [1]
             - run_SSM(A, B, C, u) in The Annotated S4 [2]
 
         Args:
-            x: shape (b, l, d_in)    (See Glossary at top for definitions of b, l, d_in, n...)
-    
+            x: shape (l, ... h)    (See Glossary at top for definitions of b, l, h, n...)
+
         Returns:
-            output: shape (b, l, d_in)
+            output: shape (b, l, h)
 
         Official Implementation:
             mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-            
-        """
-        (d_in, n) = self.A_log.shape
 
+        """
         # Compute ∆ A B C D, the state space parameters.
         #     A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
         #     ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
         #                                  and is why Mamba is called **selective** state spaces)
-        
-        A = -jnp.exp(self.A_log.float())  # shape (d_in, n)
 
-        (Δ, B, C) = rearrange(self.x_proj(x), "l (dt_rank n m) -> l dt_rank, l n 1, l 1 m", dt_rank=self.dt_rank, n=n, m=n)
+        A = -jnp.exp(self.A_log.value)  # shape (h, n)
 
-        Δ = nnx.softplus(self.dt_proj(Δ))  # (l, d_in)
-        
-        D = self.D.float()
-        
-        y = selective_scan(x, Δ, A, B, C, D)  # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
-        
+        (B, C, dt) = jnp.split(
+            self.ssm_proj(u),
+            [self.state_dim, 2 * self.state_dim],
+            axis=-1,
+        )
+
+        Δ = nnx.softplus(self.dt_proj(dt))  # (l, h)
+
+        D = self.D.value
+
+        # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
+        y = selective_scan(u, Δ, A, B, C, D)
+
         return y
 
-    
-def selective_scan(u, delta, A, B, C, D, dt_min=0.001, dt_max=0.1):
-    """
-    Selective SSM scan with proper gating mechanism.
-    
-    Args:
-        u: input, shape (batch, length, d_model)
-        delta: time delta, shape (batch, length, d_state)
-        A: state matrix, shape (d_state, d_inner)
-        B: input matrix, shape (d_state, d_inner)
-        C: output matrix, shape (d_inner, d_state)
-        D: skip connection, shape (d_model,)
-    """
-    # Clamp delta values
-    delta = jnp.clip(delta, dt_min, dt_max)
-    
-    # Discretize continuous parameters
-    ΔA = jnp.exp(jnp.einsum('b l d, d n -> b l n d', delta, A))
-    ΔB = jnp.einsum('b l d, d n, b l d -> b l d n', delta, B, u)
-    
-    # Selective scan with state handling
-    def step(carry, inputs):
-        x_prev = carry
-        ΔA_t, ΔB_t, C_t = inputs
-        
-        # State update
-        x_cur = jnp.einsum('n d, d -> n', ΔA_t, x_prev) + ΔB_t
-        # Output projection
-        y_t = jnp.einsum('d n, n -> d', C_t, x_cur)
-        
-        return x_cur, y_t
-    
-    # Initialize state
-    batch_size = u.shape[0]
-    x0 = jnp.zeros((batch_size, A.shape[-1]))
-    
-    # Run scan
-    _, y = jax.lax.scan(step, x0, (ΔA, ΔB, C))
-    
-    # Skip connection
-    out = y + jnp.einsum('b l d, d -> b l d', u, D)
-    
-    return out
 
+class Mamba(nnx.Module):
+    @struct.dataclass
+    class Params:
+        num_features: Annotated[int, "F"]
+        expand: Annotated[int, "E"] = 2
+        ssm_dim: Annotated[int, "N"] = 16
+        kernel_size: int = 4
+        use_proj_bias: bool = False
+        use_conv_bias: bool = True
+        activation: Callable[[Array], Array] = struct.field(
+            default_factory=lambda: nnx.silu
+        )
+
+        @property
+        def dt_rank(self):
+            return self.num_features // self.ssm_dim
+
+        @property
+        def ssm_features(self):
+            return int(self.expand * self.num_features)
+
+        @property
+        def use_convolution(self):
+            return self.kernel_size > 1
+
+    def __init__(self, params: Params, *, rngs: nnx.Rngs):
+        """A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."""
+        self.params = params
+
+        self.in_proj = nnx.Linear(
+            params.num_features,
+            params.ssm_features * 2,
+            use_bias=params.use_proj_bias,
+            rngs=rngs,
+        )
+
+        if params.use_convolution:
+            self.conv = nnx.Conv(
+                in_features=params.ssm_features,
+                out_features=params.ssm_features,
+                kernel_size=params.kernel_size,
+                use_bias=params.use_conv_bias,
+                feature_group_count=params.expand,
+                padding="CAUSAL",
+                rngs=rngs,
+            )
+
+        self.ssm = SSM(
+            params.ssm_features,
+            params.ssm_dim,
+            params.dt_rank,
+            rngs=rngs,
+        )
+
+        self.out_proj = nnx.Linear(
+            params.ssm_features,
+            params.num_features,
+            use_bias=params.use_proj_bias,
+            rngs=rngs,
+        )
+
+    def __call__(self, x: Float[Array, "l ... f"]) -> Float[Array, "l ... f"]:
+        """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
+
+        Args:
+            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, h, n...)
+
+        Returns:
+            output: shape (b, l, d)
+
+        Official Implementation:
+            class Mamba, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L119
+            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
+
+        """
+        # (l, ..., f) = x.shape
+
+        x = self.in_proj(x)
+        (x, res) = jnp.split(x, 2, axis=-1)  # shape (l, ..., 2 * f)
+
+        if self.params.use_convolution:
+            # x = rearrange(x, 'b l h -> b h l')
+            x = self.conv(x)  # [:, :, :l]
+            # x = rearrange(x, 'b h l -> b l h')
+
+        x = self.params.activation(x)
+
+        y = self.ssm(x)
+
+        y = y * self.params.activation(res)
+
+        output = self.out_proj(y)
+
+        return output
+
+
+if __name__ == "__main__":
+    rngs = nnx.Rngs(1)
+    ssm = SSM(2, 4, 8, rngs=rngs)
+    x = jnp.ones((100, 16, 2))
+    y = ssm(x)
+
+    mamba = Mamba(Mamba.Params(16), rngs=rngs)
+    x = jnp.ones((100, 16, 16))
+    y = mamba(x)
+    
+
+# %%

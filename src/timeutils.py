@@ -31,7 +31,7 @@ def millis(time: Date | DateTime | TimeDelta | int) -> int:
 _1_DAY = TimeDelta(days=1)
 _1_DAY_MS = millis(_1_DAY)
 
-def _format_timedelta(time_delta: TimeDelta):
+def format_timedelta(time_delta: TimeDelta):
 
     weeks, days = divmod(time_delta.days, 7)
     hours, seconds = divmod(time_delta.seconds, 3600)
@@ -61,7 +61,7 @@ class TimeRange:
         return (
             f'since {self.start.isoformat()}'
             f' to {self.stop.isoformat()}'
-            f' every {_format_timedelta(self.step)}'
+            f' every {format_timedelta(self.step)}'
         )
 
     def __len__(self):
@@ -78,6 +78,8 @@ class TimeRange:
     
     def __contains__(self, dt: DateTime):
         return self.start <= dt < self.stop
+
+    
 
     def dates(self):
         start, stop = self.start, self.stop
@@ -101,10 +103,10 @@ class TimeRange:
         )
     
     @staticmethod
-    def from_date(date: Date, step: TimeDelta):
+    def from_date(date: Date, step: TimeDeltaParseable):
         start = DateTime.combine(date, Time.min).replace(tzinfo=TimeZone.utc)
         stop = start + _1_DAY
-        return TimeRange(start, stop, step)
+        return TimeRange(start, stop, parse_timedelta(step))
     
     def with_step(self, step: TimeDelta):
         return TimeRange(self.start, self.stop, step)

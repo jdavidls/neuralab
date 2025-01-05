@@ -189,6 +189,17 @@ class HMM(nnx.Module):
 
         return viterbi_softpath(log_deltas, temperature)
 
+    def norm(self, obs):
+        states = self(obs)
+
+        # TODO: Normaliza las obervaciones basandose en los estados retornados
+        # para ello utiliza las medias y covarianzas de los estados
+        # y retorna las observaciones normalizadas
+        # utiliza los estados para ponderar las normalizaciones
+
+        return states
+        
+
     @classmethod
     def stack(cls, num_layers, *args, **kwargs):
         def layer(_):
@@ -324,18 +335,4 @@ if __name__ == "__main__":
     train_hmm(model, optimizer, sequences, true_states, num_epochs=2000)
     nnx.display(model)
 
-#%%
-
-def hmm_stack(num_states: int, num_features: int, num_layers: int, rngs: nnx.Rngs):
-
-    @nnx.vmap
-    def layer(idx):
-        return HMM(num_states, num_features, rngs)
-    
-    return layer(jnp.arange(num_layers))
-    
-stack = hmm_stack(num_states=3, num_features=2, num_layers=5, rngs=nnx.Rngs(0))
-
-
-
-
+    #%%

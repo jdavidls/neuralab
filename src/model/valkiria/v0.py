@@ -104,7 +104,7 @@ def train_step(model, opt, batch):
 
 # %%
 if __name__ == "__main__":
-    from dataproxy.dataset import DATASETS
+    from neuralab.ds.dataset import DATASETS
 
     rngs = nnx.Rngs(0)
     model = V0(rngs=rngs)
