@@ -17,9 +17,7 @@ from flax import nnx, struct
 from jax import lax
 from jax import numpy as jnp
 
-from dataproxy.dataset import Dataset
-from dataproxy.labelset import Labelset
-
+from neuralab.trading.dataset import Dataset
 
 @dataclass
 class RiskControl:
@@ -150,6 +148,7 @@ def sim(
 
 
 # %%
+# trading.labels
 import optax
 from jax import random
 from tqdm import trange
@@ -162,7 +161,7 @@ def fit_labels(
     lr=1e-2,
     mode="max_total_perf",
 ):
-
+    # from neuralab.nl.sim import sim, SimParams
     if labels is None:
         labels = dataset.returns
 
@@ -252,105 +251,109 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-# %%
-from jaxtyping import Array, Float, Int
-from jax import lax, tree
-from functools import cached_property
-## Events and Trends are Labels
+    # %%
+    from jaxtyping import Array, Float, Int
+    from jax import lax, tree
+    from functools import cached_property
+    ## Events and Trends are Labels
 
 
-@struct.dataclass
-class Events(struct.PyTreeNode):
-    dataset: Dataset
-    asset: Int[Array, "..."]
-    market: Int[Array, "..."]
-    at: Int[Array, "..."]
+    @struct.dataclass
+    class Events(struct.PyTreeNode):
+        dataset: Dataset
+        asset: Int[Array, "..."]
+        market: Int[Array, "..."]
+        at: Int[Array, "..."]
 
 
-@struct.dataclass
-class Trends(struct.PyTreeNode):
-    dataset: Dataset = struct.field(pytree_node=False)
+    @struct.dataclass
+    class Trends(struct.PyTreeNode):
+        dataset: Dataset = struct.field(pytree_node=False)
 
-    asset: Int[Array, "..."]
-    market: Int[Array, "..."]
-    start_at: Int[Array, "..."]
-    stop_at: Int[Array, "..."]
+        asset: Int[Array, "..."]
+        market: Int[Array, "..."]
+        start_at: Int[Array, "..."]
+        stop_at: Int[Array, "..."]
 
-    @cached_property
-    def duration(self):
-        return self.stop_at - self.start_at
+        @cached_property
+        def duration(self):
+            return self.stop_at - self.start_at
 
-    @property
-    def start_log_price(self):
-        return self.dataset.log_price[self.start_at, self.asset, self.market]
+        @property
+        def start_log_price(self):
+            return self.dataset.log_price[self.start_at, self.asset, self.market]
 
-    @property
-    def stop_log_price(self):
-        return self.dataset.log_price[self.stop_at, self.asset, self.market]
+        @property
+        def stop_log_price(self):
+            return self.dataset.log_price[self.stop_at, self.asset, self.market]
 
-    @property
-    def returns(self):
-        return self.stop_log_price - self.start_log_price
+        @property
+        def returns(self):
+            return self.stop_log_price - self.start_log_price
 
-    @property
-    def direction(self):
-        return jnp.sign(self.returns)
+        @property
+        def direction(self):
+            return jnp.sign(self.returns)
 
-    def __len__(self):
-        return len(self.start_at)
+        def __len__(self):
+            return len(self.start_at)
 
-    def __getitem__(self, *args):
-        return tree.map(lambda v: v.__getitem__(*args), self)
+        def __getitem__(self, *args):
+            return tree.map(lambda v: v.__getitem__(*args), self)
 
-@struct.dataclass
-class Labelset(struct.PyTreeNode):
-    dataset: Dataset
-    tags: Float[Array, "time asset market"]
-    trends: dict[tuple[int, int], Trends]
-    events: dict[tuple[int, int], Events]
+    @struct.dataclass
+    class Labelset(struct.PyTreeNode):
+        dataset: Dataset
+        tags: Float[Array, "time asset market"]
+        trends: dict[tuple[int, int], Trends]
+        events: dict[tuple[int, int], Events]
 
-    @classmethod
-    def from_dataset_tags(cls, dataset: Dataset, tags: Float[Array, "time ..."]):
-        events = jnp.diff(jnp.sign(tags), axis=0, append=tags[-1:]) / 2
+        @classmethod
+        def from_dataset_tags(cls, dataset: Dataset, tags: Float[Array, "time ..."]):
+            events = jnp.diff(jnp.sign(tags), axis=0, append=tags[-1:]) / 2
 
-        t_idx, a_idx, m_idx = jnp.nonzero(events)
+            t_idx, a_idx, m_idx = jnp.nonzero(events)
 
-        def event_fn(a, m):
-            at = t_idx[(a_idx == a) & (m_idx == m)]
-            return Events(
-                dataset=dataset,
-                asset=jnp.full_like(at, a),
-                market=jnp.full_like(at, m),
-                at=at,
-            )
+            def event_fn(a, m):
+                at = t_idx[(a_idx == a) & (m_idx == m)]
+                return Events(
+                    dataset=dataset,
+                    asset=jnp.full_like(at, a),
+                    market=jnp.full_like(at, m),
+                    at=at,
+                )
 
-        events = {
-            (a, m): event_fn(a, m)
-            for a in range(tags.shape[1])
-            for m in range(tags.shape[2])
-        }
+            events = {
+                (a, m): event_fn(a, m)
+                for a in range(tags.shape[1])
+                for m in range(tags.shape[2])
+            }
 
-        def trend_fn(a, m):
-            start_idx = t_idx[(a_idx == a) & (m_idx == m)]
-            start_idx, stop_idx = start_idx[:-1], start_idx[1:]
-            return Trends(
-                dataset=dataset,
-                asset=jnp.full_like(stop_idx, a),
-                market=jnp.full_like(stop_idx, m),
-                start_at=start_idx,
-                stop_at=stop_idx,
-            )
+            def trend_fn(a, m):
+                start_idx = t_idx[(a_idx == a) & (m_idx == m)]
+                start_idx, stop_idx = start_idx[:-1], start_idx[1:]
+                return Trends(
+                    dataset=dataset,
+                    asset=jnp.full_like(stop_idx, a),
+                    market=jnp.full_like(stop_idx, m),
+                    start_at=start_idx,
+                    stop_at=stop_idx,
+                )
 
-        trends = {
-            (a, m): trend_fn(a, m)
-            for a in range(tags.shape[1])
-            for m in range(tags.shape[2])
-        }
+            trends = {
+                (a, m): trend_fn(a, m)
+                for a in range(tags.shape[1])
+                for m in range(tags.shape[2])
+            }
 
-        return cls(dataset=dataset, tags=tags, events=events, trends=trends)
+            return cls(dataset=dataset, tags=tags, events=events, trends=trends)
 
 
-ls = Labelset.from_dataset_tags(dataset, labels)
-tr = ls.trends[(0,0)]
+    ls = Labelset.from_dataset_tags(dataset, labels)
+    tr = ls.trends[(0,0)]
 
-# %%
+    # %%
+    import pickle
+    data = pickle.dumps(ls)
+    lss = pickle.loads(data)
+

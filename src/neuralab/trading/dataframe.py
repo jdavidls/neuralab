@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import torch as pt
 
-from dataproxy.loader import Loader
-from timeutils import Date, TimeRange, millis
+from neuralab.utils.loader import Loader
+from neuralab.utils.timeutils import Date, TimeRange, millis
 
 log = get_logger(__name__)
 

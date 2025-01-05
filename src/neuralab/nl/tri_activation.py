@@ -7,9 +7,6 @@ from jax import jit, nn
 from jax import numpy as np
 from jaxtyping import Array, Float
 
-from neuralab.utils import optional
-
-
 @jit
 def triact(
     x: Float[Array, "..."],
