@@ -15,6 +15,7 @@ from jaxtyping import Array, Float, Int
 from pandas import DataFrame
 from tqdm.notebook import tqdm, trange
 
+from neuralab import fn
 from neuralab.trading.dataframe import (
     DEFAULT_MARKETS,
     DEFAULT_SYMBOLS,
@@ -83,7 +84,7 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
     def __getitem__(self, args) -> Dataset:
         return tree.map(lambda v: v.__getitem__(args), self)
 
-    def features(self, feature_names: list[Feature], axis=-1):
+    def features(self, *feature_names: Feature, axis=-1):
         return jnp.stack(
             [getattr(self, feature) for feature in feature_names], axis=axis
         )
@@ -124,8 +125,8 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
             log_price=log_price,
             returns=jnp.diff(log_price, append=log_price[-1:], axis=0),
             diff_log_price=jnp.diff(log_price, prepend=log_price[:1], axis=0),
-            log_volume=jnp.log(vol),
-            log_imbalance=jnp.log(ask_vol) - jnp.log(bid_vol),
+            log_volume=jnp.log1p(vol),
+            log_imbalance=jnp.log1p(ask_vol) - jnp.log1p(bid_vol),
         )
 
     @classmethod
@@ -150,6 +151,8 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
     def save(self, name: str):
         global _loaded_datasets
 
+        fn.check(self, asserts=True)
+
         path = NL_HOME_PATH / type(self).__qualname__
         path.mkdir(parents=True, exist_ok=True)
 
@@ -171,6 +174,7 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
             with filename.open("rb") as f:
                 dataset = pickle.load(f)
                 _loaded_datasets[name] = dataset
+                fn.check(dataset, asserts=True)
                 return dataset
 
         except FileNotFoundError:

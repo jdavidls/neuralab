@@ -110,7 +110,7 @@ class Trainer(nnx.Module):
         self.side_trend_cores = nnx.Cache(trend_scores[side_trend_idx])
         self.down_trend_scores = nnx.Cache(trend_scores[down_trend_idx])
 
-    @nnx.jit
+    #@nnx.jit
     def get_labels(self):
         mask = jnp.zeros(self.fit_dataset.shape)
 
@@ -164,7 +164,7 @@ class Trainer(nnx.Module):
 
         return loss, metrics
 
-    def batched_training(self, *, batch_size, use_scan=False):
+    def batched_training(self, *, batch_size, use_scan=False, batch_skip=0):
 
         x = self.fit_dataset
         y = self.get_labels()
@@ -194,7 +194,10 @@ class Trainer(nnx.Module):
             losses = []
             metrics = []
             progbar = tqdm(zip(x, y), total=batch_count)
-            for xx, yy in progbar:
+            for n, (xx, yy) in enumerate(progbar):
+                if n < batch_skip:
+                    continue
+
                 loss, mets = self.train_step(xx, yy)
                 if jnp.isnan(loss):
                     raise ValueError("NaN loss")
@@ -213,13 +216,6 @@ class Trainer(nnx.Module):
         def loss_fn(model):
             loss = model.loss(x, y)
 
-            # losses = nnx.state(model, nl.Loss)
-
-            # # Flatten the pytree
-            # losses = tree.leaves(losses)
-
-            # # Sum the flattened elements
-            # loss = loss + sum(jnp.mean(l) for l in losses)
             safe_loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
 
             return safe_loss, (loss, nnx.pop(model, nl.Metric))
@@ -227,6 +223,8 @@ class Trainer(nnx.Module):
         # batch_scan
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
         (_, (loss, metrics)), grad = grad_fn(self.model)
+
+
 
         self.optimizer.update(grad)
 

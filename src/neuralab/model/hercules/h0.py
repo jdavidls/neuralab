@@ -18,9 +18,9 @@ class H0(nnx.Module):
 
         in_features: list[Feature] = struct.field(
             default_factory=lambda: [
+                "log_price",
                 "log_volume",
                 "log_imbalance",
-                "diff_log_price",
             ]
         )
 
@@ -75,10 +75,10 @@ class H0(nnx.Module):
         self.sim_proj = nnx.Linear(settings.num_features, 3, rngs=rngs)
 
     def __call__(self, ds: Dataset):
-        x = ds.features(self.settings.in_features, axis=-1)  # [time, ..., feature]
+        x = ds.features(*self.settings.in_features, axis=-1)  # [time, ..., feature]
 
         # EMA
-        x = self.ema.std(x)  # [time, market, ..., feature, ema_layer]
+        x = ema = self.ema.norm(x)  # [time, market, ..., feature, ema_layer]
 
         x = self.in_proj(rearrange(x, "t ... f l -> t ... (f l)"))
 
@@ -96,27 +96,35 @@ class H0(nnx.Module):
         # x = rearrange(s, "t ... s l -> t ... (s l)")
 
         # Mamba
-        x = self.layers(x)
+        x = ssm = self.layers(x)
 
         # Sim
         x = self.sim_proj(x)
 
-        return x
+        return x, ema, ssm
     
     def loss(self, x: Dataset, y: Labels):
-        logits = self(x)
+        logits, *_ = self(x)
 
         sce = y.mask * losses.safe_softmax_cross_entropy(logits, y.cats)
 
         return -jnp.mean(sce)
 
-if __name__ == "__main__":
-    from neuralab.model.hercules.h0 import H0
 
+#%%
+if __name__ == "__main__":
+    import jax 
+    jax.config.update("jax_debug_nans", True)
     model = H0()
     trainer = Trainer(model)
     dataset = Dataset.load('default-fit')
-    trainer(dataset)
+    #%%
+    trainer(dataset, epochs=10)
 
-    
-# %%
+    #%% 
+    logits, ema, ssm = model(dataset[:, 115:116])
+    # %%
+    from matplotlib import pyplot as plt
+
+    plt.pcolormesh(logits[:, 0, 0])
+    plt.colorbar()

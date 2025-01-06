@@ -7,19 +7,19 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.12"
-flax = "^0.10.2"
+#flax = "^0.10.2"
 torch = {extras = ["cpu"], version = "^2.5.1"}
 pandas = "^2.2.3"
-jax = {extras = ["cuda12"], version = "^0.4.35"}
 matplotlib = "^3.9.3"
 einops = "^0.8.0"
 treescope = "^0.1.7"
-jaxtyping = "^0.2.36"
-pyarrow = "^18.1.0"
+#jaxtyping = "^0.2.36"
 requests-toolbelt = "^1.0.0"
 atpbar = {extras = ["jupyter"], version = "^2.0.5"}
-hmmlearn = "^0.3.3"
 tqdm = "^4.67.1"
+optax = "^0.2.4"
+flax = "^0.10.2"
+jaxtyping = "^0.2.36"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

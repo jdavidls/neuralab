@@ -45,8 +45,6 @@ def ema(
     """
     if init is None:
         init = x[0]
-        if non_stationary_mask is not None:
-            init *= non_stationary_mask
         init = jnp.repeat(init, decay.shape[0], axis=-1)
 
     alpha = 2 / (decay + 1)

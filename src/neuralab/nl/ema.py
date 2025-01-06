@@ -26,7 +26,7 @@ class EMA(nnx.Module):
                updated during computation.
     """
 
-    def __init__(self, num_layers: int, min_t=2, max_t=512, learn=False):
+    def __init__(self, num_layers: int, min_t=2, max_t=512, learn=True):
         self.num_layers = num_layers
         self.training = False
         self.min_t = min_t
@@ -51,7 +51,7 @@ class EMA(nnx.Module):
         """Resets the internal EMA state."""
         self.state.value = None
 
-    def __call__(self, x, is_stationary=False):
+    def __call__(self, x):
         """Computes EMAs for the given input.
 
         Args:
@@ -71,7 +71,7 @@ class EMA(nnx.Module):
         # self.state.value = ema_x[-1]
         return ema_x
 
-    def avgvar(self, x, is_stationary=False):
+    def avgvar(self, x, eps=1e-4):
         """Computes the exponential moving average and variance of the input.
 
         Args:
@@ -80,8 +80,8 @@ class EMA(nnx.Module):
         Returns:
             Tuple containing the EMA and EMV.
         """
-        x2 = np.square(x)
-        emas = self(np.stack([x, x2], axis=1), is_stationary=is_stationary)
+        x2 = np.square(x * (1 + eps))
+        emas = self(np.stack([x, x2], axis=1))
         ema, ema_x2 = emas[:, 0], emas[:, 1]
 
         # Exponential moving variance
@@ -89,7 +89,7 @@ class EMA(nnx.Module):
 
         return ema, emv
 
-    def std(self, x, eps=1e-4, is_stationary=False):
+    def norm(self, x, eps=1e-4):
         """Standardizes the input using EMA and ESD.
 
         Args:
@@ -108,8 +108,8 @@ class EMA(nnx.Module):
         The `(1 - α)` term in the denominator provides numerical stability,
         preventing division by zero when ESD is close to zero.
         """
-        ema, emv = self.avgvar(x, is_stationary=is_stationary)
-        return (x[..., None] - ema) * lax.rsqrt(emv)
+        ema, emv = self.avgvar(x)
+        return (x[..., None] - ema) * lax.rsqrt(emv+eps)
 
 
 if __name__ == "__main__":
@@ -128,10 +128,10 @@ if __name__ == "__main__":
     ema = EMA(num_layers)
     # u = np.cumsum(random.normal(random.PRNGKey(3), (L,)))
     u_avg, u_var = ema.avgvar(u)
-    u_std = ema.std(u)
+    u_std = ema.norm(u)
 
-    v_avg, v_var = ema.avgvar(v, is_stationary=True)
-    v_std = ema.std(v, is_stationary=True)
+    v_avg, v_var = ema.avgvar(v)
+    v_std = ema.norm(v)
 
     # plt.plot(u, label="u")
     plt.title("EM Average")
@@ -151,31 +151,33 @@ if __name__ == "__main__":
 
     plt.title("EM Standarization")
     for n in range(num_layers):
-        plt.plot(u_std[:L, n], label=f"std(u) {ema.decay[n]:.2f}", alpha=0.5)
-        plt.plot(v_std[:L, n], label=f"std(v) {ema.decay[n]:.2f}", alpha=0.5)
+        plt.plot(u_std[:L, n], label=f"norm(u) {ema.decay[n]:.2f}", alpha=0.5)
+        plt.plot(v_std[:L, n], label=f"norm(v) {ema.decay[n]:.2f}", alpha=0.5)
     plt.legend()
     plt.show()
 
     # %%
-    from neuralab.nl import triact
-
-    # plt.plot(u_ems[:, 0])
-    plt.pcolormesh((triact(v_std[:, 0]) * u_std[:, 0, None]).T)
-    # plt.plot(np.log(p), label="u_ems")
-    plt.show()
-
-    # %%
-    plt.hist(v_std[:, 2], bins=100)
-    plt.show()
-
-    # %%
-    x = np.linspace(1, 10, 100)
-    decay = lambda x: 2 / (x + 1)
-
-    # for n in range(1,5):
-    plt.plot(x, decay(x), label="decay(x)")
+    p_avg, p_var = ema.avgvar(p)
+    p_std = ema.norm(p)
+    # plt.plot(u, label="u")
+    plt.title("EM Average")
+    # plt.plot(u[:L], label=f"true")
+    for n in range(num_layers):
+        plt.plot(p_avg[:L, n], label=f"avg(u) {ema.decay[n]:.2f}")
     plt.legend()
     plt.show()
 
+    plt.title("EM Variance")
+    for n in range(num_layers):
+        plt.plot(p_var[:L, n], label=f"var(u) {ema.decay[n]:.2f}")
+    plt.legend()
+    plt.show()
+
+    plt.title("EM Standarization")
+    for n in range(num_layers):
+        plt.plot(p_std[:L, n], label=f"norm(u) {ema.decay[n]:.2f}", alpha=0.5)
+
+    plt.legend()
+    plt.show()
 
 # %%

@@ -33,72 +33,8 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
+from neuralab.nl.norm import RMSNorm
 
-def selective_scan(
-    u: Float[Array, "l ... h"],
-    dt: Float[Array, "l ... h"],
-    A: Float[Array, "n n"],
-    B: Float[Array, "n h"],
-    C: Float[Array, "h n"],
-    D: Float[Array, "h"],
-    dt_min=0.001,
-    dt_max=0.1,
-):
-    """Selective SSM scan with proper gating mechanism.
-
-    Args:
-        u: input sequences             (l, ..., h)
-        dt: time delta                 (l, ..., h)
-        A: state matrix               (n, n)
-        B: input matrix               (n, h)
-        C: output matrix              (h, n)
-        D: skip connection            (h,)
-        dt_min: minimum delta value
-        dt_max: maximum delta value
-
-    Returns:
-        output: transformed sequence   (l, ..., h)
-    """
-    batch_shape = u.shape[1:-1]
-
-    # Clamp delta values
-    dt = jnp.clip(dt, dt_min, dt_max)
-
-    # Discretize continuous parameters
-    ΔA = jnp.exp(einsum(dt, A, "l ... d, d n -> l ... d n"))
-    ΔB_u = einsum(dt, B, u, "l ... d, l ... n, l ... d -> l ... d n")
-
-    # Selective scan with state handling
-    if False:
-        @nnx.scan
-        def selective_scan_step(carry, inputs):
-            x_t_1 = carry
-            ΔA_t, ΔB_u_t, C_t = inputs
-
-            # State update
-            x_t = ΔA_t * x_t_1 + ΔB_u_t
-
-            # Output projection
-            y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
-
-            return x_t, y_t
-
-        # Initialize state
-        x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
-
-        # Run scan
-        _, y = selective_scan_step(x0, (ΔA, ΔB_u, C))
-    else:
-        def selective_scan_step(s, c):
-            return c[0] * s[0], c[0] * s[1] + c[1]
-
-        # Run scan
-        _, x = lax.associative_scan(selective_scan_step, (ΔA, ΔB_u))
-        y = einsum(C, x, "... n, ... d n -> ... d")
-        
-
-    # Skip connection
-    return y + u * D
 
 
 class SSM(nnx.Module):
@@ -134,6 +70,7 @@ class SSM(nnx.Module):
         )
 
         # dt_proj projects Δ from dt_rank to h
+        ## https://github.com/vvvm23/mamba-jax/blob/main/mamba_jax/modelling/equinox/blocks.py#L95
         self.dt_proj = nnx.Linear(dt_rank, features, use_bias=True, rngs=rngs)
 
     def __call__(self, u: Float[Array, "T ... H"]) -> Float[Array, "T ... H"]:
@@ -184,6 +121,7 @@ class Mamba(nnx.Module):
         use_proj_bias: bool = False
         use_conv_bias: bool = True
         activation: Callable[[Array], Array] = nnx.silu
+        residual: bool = True
 
         @property
         def dt_rank(self):
@@ -238,7 +176,7 @@ class Mamba(nnx.Module):
 
         self.norm = nnx.RMSNorm(settings.num_features, rngs=rngs)
 
-    def __call__(self, x: Float[Array, "l ... f"]) -> Float[Array, "l ... f"]:
+    def __call__(self, inp: Float[Array, "l ... f"]) -> Float[Array, "l ... f"]:
         """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
 
         Args:
@@ -252,7 +190,7 @@ class Mamba(nnx.Module):
             mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
 
         """
-        x = self.in_proj(x)
+        x = self.in_proj(inp)
         (x, res) = jnp.split(x, 2, axis=-1)  # shape (l, ..., 2 * f)
 
         if self.settings.use_convolution:
@@ -268,7 +206,10 @@ class Mamba(nnx.Module):
 
         output = self.out_proj(y)
 
-        return output
+        if self.settings.residual:
+            output = output + inp
+
+        return self.norm(output)
 
 
 if __name__ == "__main__":
@@ -282,4 +223,67 @@ if __name__ == "__main__":
     y = mamba(x)
     
 
-# %%
+def selective_scan(
+    u: Float[Array, "l ... h"],
+    dt: Float[Array, "l ... h"],
+    A: Float[Array, "n n"],
+    B: Float[Array, "n h"],
+    C: Float[Array, "h n"],
+    D: float | Float[Array, "h"] = 1.,
+    dt_limits=(0.001, 0.1),
+):
+    """Selective SSM scan with proper gating mechanism.
+
+    Args:
+        u: input sequences             (l, ..., h)
+        dt: time delta                 (l, ..., h)
+        A: state matrix               (n, n)
+        B: input matrix               (n, h)
+        C: output matrix              (h, n)
+        D: skip connection            (h,)
+        dt_min: minimum delta value
+        dt_max: maximum delta value
+
+    Returns:
+        output: transformed sequence   (l, ..., h)
+    """
+    batch_shape = u.shape[1:-1]
+
+    # Clamp delta values
+    dt = jnp.clip(dt, *dt_limits)
+
+    # Discretize continuous parameters
+    ΔA = jnp.exp(einsum(dt, A, "l ... d, d n -> l ... d n"))
+    ΔB_u = einsum(dt, B, u, "l ... d, l ... n, l ... d -> l ... d n")
+
+    # Selective scan with state handling
+    if False:
+        @nnx.scan
+        def selective_scan_step(carry, inputs):
+            x_t_1 = carry
+            ΔA_t, ΔB_u_t, C_t = inputs
+
+            # State update
+            x_t = ΔA_t * x_t_1 + ΔB_u_t
+
+            # Output projection
+            y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
+
+            return x_t, y_t
+
+        # Initialize state
+        x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
+
+        # Run scan
+        _, y = selective_scan_step(x0, (ΔA, ΔB_u, C))
+    else:
+        def selective_scan_step(s, c):
+            return c[0] * s[0], c[0] * s[1] + c[1]
+
+        # Run scan
+        _, x = lax.associative_scan(selective_scan_step, (ΔA, ΔB_u))
+        y = einsum(C, x, "... n, ... d n -> ... d")
+        
+
+    # Skip connection
+    return y + u * D
