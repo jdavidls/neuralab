@@ -109,28 +109,22 @@ class EMA(nnx.Module):
         preventing division by zero when ESD is close to zero.
         """
         ema, emv = self.avgvar(x, is_stationary=is_stationary)
-        emd = np.sqrt(eps + emv)
-
-        # Standarize the input
-        # ema_normalized = (x[..., None] - ema + eps) / (eps + esd * (1+self.decay))
-        x = x[..., None]
-        ema_normalized = (x - ema + eps) / (emd + eps)
-
-        return ema_normalized
+        return (x[..., None] - ema) * lax.rsqrt(emv)
 
 
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
-    from neuralab.ds.dataset import DATASETS
+    from neuralab.trading.dataset import Dataset
+
+    ds = Dataset.load()
 
     L = 500
-    p = DATASETS[0].log_price[:L]
-    u = DATASETS[0].log_volume[:L]
-    v = DATASETS[0].log_volume_imbalance[:L]
+    p = ds.log_price[:L, 0,0]
+    u = ds.log_volume[:L,0,0]
+    v = ds.log_imbalance[:L,0,0]
 
     num_layers = 4
-    rngs = nnx.Rngs(3)
     ema = EMA(num_layers)
     # u = np.cumsum(random.normal(random.PRNGKey(3), (L,)))
     u_avg, u_var = ema.avgvar(u)

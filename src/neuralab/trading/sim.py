@@ -104,7 +104,7 @@ def sim(
     # if params.max_leverage is not None:
     # weights *= 1e1
 
-    turnover = jnp.abs(jnp.diff(weights, axis=0, append=weights[-1:]))
+    turnover = jnp.abs(jnp.diff(weights, append=weights[-1:], axis=0))
 
     # if params.portfolio_mode is True:
     # turnover = jnp.sum(turnover, axis=1, keepdims=True)
@@ -213,7 +213,7 @@ def fit_labels(
 # %%
 if __name__ == "__main__":
 
-    dataset = Dataset.default()
+    dataset = Dataset.load()
     rngs = nnx.Rngs(0)
 
     labels = fit_labels(dataset)

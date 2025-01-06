@@ -69,25 +69,33 @@ def selective_scan(
     ΔB_u = einsum(dt, B, u, "l ... d, l ... n, l ... d -> l ... d n")
 
     # Selective scan with state handling
-    def step(carry, inputs):
-        x_t_1 = carry
-        ΔA_t, ΔB_u_t, C_t = inputs
+    if False:
+        @nnx.scan
+        def selective_scan_step(carry, inputs):
+            x_t_1 = carry
+            ΔA_t, ΔB_u_t, C_t = inputs
 
-        # State update
+            # State update
+            x_t = ΔA_t * x_t_1 + ΔB_u_t
 
-        x_t = ΔA_t * x_t_1 + ΔB_u_t
+            # Output projection
+            y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
 
-        # Output projection
-        y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
+            return x_t, y_t
 
-        return x_t, y_t
+        # Initialize state
+        x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
 
-    # Initialize state
-    x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
+        # Run scan
+        _, y = selective_scan_step(x0, (ΔA, ΔB_u, C))
+    else:
+        def selective_scan_step(s, c):
+            return c[0] * s[0], c[0] * s[1] + c[1]
 
-    # Run scan
-
-    _, y = lax.scan(step, x0, (ΔA, ΔB_u, C))
+        # Run scan
+        _, x = lax.associative_scan(selective_scan_step, (ΔA, ΔB_u))
+        y = einsum(C, x, "... n, ... d n -> ... d")
+        
 
     # Skip connection
     return y + u * D
@@ -168,16 +176,14 @@ class SSM(nnx.Module):
 
 class Mamba(nnx.Module):
     @struct.dataclass
-    class Params:
+    class Settings:
         num_features: Annotated[int, "F"]
         expand: Annotated[int, "E"] = 2
         ssm_dim: Annotated[int, "N"] = 16
         kernel_size: int = 4
         use_proj_bias: bool = False
         use_conv_bias: bool = True
-        activation: Callable[[Array], Array] = struct.field(
-            default_factory=lambda: nnx.silu
-        )
+        activation: Callable[[Array], Array] = nnx.silu
 
         @property
         def dt_rank(self):
@@ -191,41 +197,46 @@ class Mamba(nnx.Module):
         def use_convolution(self):
             return self.kernel_size > 1
 
-    def __init__(self, params: Params, *, rngs: nnx.Rngs):
+        def build(self, rngs: nnx.Rngs):
+            return Mamba(self, rngs=rngs)
+
+    def __init__(self, settings: Settings, *, rngs: nnx.Rngs):
         """A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."""
-        self.params = params
+        self.settings = settings
 
         self.in_proj = nnx.Linear(
-            params.num_features,
-            params.ssm_features * 2,
-            use_bias=params.use_proj_bias,
+            settings.num_features,
+            settings.ssm_features * 2,
+            use_bias=settings.use_proj_bias,
             rngs=rngs,
         )
 
-        if params.use_convolution:
+        if settings.use_convolution:
             self.conv = nnx.Conv(
-                in_features=params.ssm_features,
-                out_features=params.ssm_features,
-                kernel_size=params.kernel_size,
-                use_bias=params.use_conv_bias,
-                feature_group_count=params.expand,
+                in_features=settings.ssm_features,
+                out_features=settings.ssm_features,
+                kernel_size=settings.kernel_size,
+                use_bias=settings.use_conv_bias,
+                feature_group_count=settings.expand,
                 padding="CAUSAL",
                 rngs=rngs,
             )
 
         self.ssm = SSM(
-            params.ssm_features,
-            params.ssm_dim,
-            params.dt_rank,
+            settings.ssm_features,
+            settings.ssm_dim,
+            settings.dt_rank,
             rngs=rngs,
         )
 
         self.out_proj = nnx.Linear(
-            params.ssm_features,
-            params.num_features,
-            use_bias=params.use_proj_bias,
+            settings.ssm_features,
+            settings.num_features,
+            use_bias=settings.use_proj_bias,
             rngs=rngs,
         )
+
+        self.norm = nnx.RMSNorm(settings.num_features, rngs=rngs)
 
     def __call__(self, x: Float[Array, "l ... f"]) -> Float[Array, "l ... f"]:
         """Mamba block forward. This looks the same as Figure 3 in Section 3.4 in the Mamba paper [1].
@@ -241,21 +252,19 @@ class Mamba(nnx.Module):
             mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
 
         """
-        # (l, ..., f) = x.shape
-
         x = self.in_proj(x)
         (x, res) = jnp.split(x, 2, axis=-1)  # shape (l, ..., 2 * f)
 
-        if self.params.use_convolution:
-            # x = rearrange(x, 'b l h -> b h l')
-            x = self.conv(x)  # [:, :, :l]
-            # x = rearrange(x, 'b h l -> b l h')
+        if self.settings.use_convolution:
+            x = rearrange(x, 't ... f -> ... t f')
+            x = self.conv(x)
+            x = rearrange(x, '... t f -> t ... f')
 
-        x = self.params.activation(x)
+        x = self.settings.activation(x)
 
         y = self.ssm(x)
 
-        y = y * self.params.activation(res)
+        y = y * self.settings.activation(res)
 
         output = self.out_proj(y)
 
@@ -268,7 +277,7 @@ if __name__ == "__main__":
     x = jnp.ones((100, 16, 2))
     y = ssm(x)
 
-    mamba = Mamba(Mamba.Params(16), rngs=rngs)
+    mamba = Mamba(Mamba.Settings(16), rngs=rngs)
     x = jnp.ones((100, 16, 16))
     y = mamba(x)
     

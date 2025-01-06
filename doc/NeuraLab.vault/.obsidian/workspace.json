@@ -4,24 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "ebab6e4a701ce921",
+        "id": "fadcd627f61200eb",
         "type": "tabs",
         "children": [
           {
-            "id": "81ea8ecc980e33e0",
+            "id": "48a41ab9a0d37031",
             "type": "leaf",
             "state": {
-              "type": "canvas",
+              "type": "markdown",
               "state": {
-                "file": "Untitled.canvas",
-                "viewState": {
-                  "x": -196,
-                  "y": -14.399999999999991,
-                  "zoom": 0
-                }
+                "file": "binance-contracts.md",
+                "mode": "source",
+                "source": false
               },
-              "icon": "lucide-layout-dashboard",
-              "title": "Untitled"
+              "icon": "lucide-file",
+              "title": "binance-contracts"
             }
           }
         ]
@@ -96,7 +93,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Untitled.canvas",
+                "file": "binance-contracts.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -106,7 +103,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Untitled"
+              "title": "Backlinks for binance-contracts"
             }
           },
           {
@@ -161,8 +158,10 @@
       "command-palette:Open command palette": false
     }
   },
-  "active": "81ea8ecc980e33e0",
+  "active": "48a41ab9a0d37031",
   "lastOpenFiles": [
-    "Untitled.canvas"
+    "binance-contracts.md",
+    "Untitled.canvas",
+    "Untitled 1.canvas"
   ]
 }
