@@ -135,31 +135,41 @@ class Trainer(nnx.Module):
 
         return Labels(labels, jnp.cumsum(mask, axis=0))
 
+    def update_epoch_progbar(self, progbar, loss, metrics):
+        progbar.set_description(f"EPOCH Loss: {jnp.mean(loss):.3f}")
+
+    def update_batch_progbar(self, progbar, loss, metrics):
+        progbar.set_description(f"BATCH Loss: {loss:.3f}")
+
     def __call__(
         self,
         fit_dataset: Dataset,
         eval_dataset: Optional[Dataset] = None,
         epochs: int = 1,
-        batch_size: int = 2,
+        batch_size: int = 1,
         batch_slice: Optional[slice] = None,
         batch_scan: bool = False,
     ):
-        loss, metrics = None, None
+        loss, metrics = jnp.inf, {}
         x = fit_dataset
         y = self.get_labels(fit_dataset)
 
         try:
-            progbar = trange(epochs)
+            epoch_progbar = tqdm(total=epochs)
+            batch_progbar = tqdm()
 
-            for epoch in progbar:
+            for epoch in range(epochs):
+                epoch_progbar.update()
+                self.update_epoch_progbar(epoch_progbar, loss, metrics)
 
                 loss, metrics = self.epoch(x, y,
                     batch_size=batch_size,
                     batch_slice=batch_slice,
                     batch_scan=batch_scan,
+                    progbar=batch_progbar,
                 )
 
-                progbar.set_description(f"Loss: {jnp.mean(loss):.3f}")
+
                 # if eval_dataset is not None:
                 # self.eval_step(eval_dataset)
 
@@ -178,6 +188,7 @@ class Trainer(nnx.Module):
         batch_scan=False,
         batch_permute=True,
         batch_axis=1,
+        progbar=None,
     ):
 
         # Batch slice
@@ -192,75 +203,59 @@ class Trainer(nnx.Module):
             y = tree.map(lambda v: v[:, perm], y)
 
         # batch rearrange
-        if batch_size is not None:
-            assert x.shape[1] % batch_size == 0
-            batch_count = x.shape[1] // batch_size
+        #if batch_size is not None:
+        assert len(x) == len(y)
+        assert x.shape[1] % batch_size == 0
+        batch_count = x.shape[1] // batch_size
 
-            def batch_rearrange(x):
-                return rearrange(
-                    x, "t (bl bc) ... -> bc t bl ...", bl=batch_size, bc=batch_count
-                )
+        def batch_rearrange(x):
+            return rearrange(
+                x, "t (bl bc) ... -> bc t bl ...", bl=batch_size, bc=batch_count
+            )
 
-            x = tree.map(batch_rearrange, x)
-            y = tree.map(batch_rearrange, y)
-        else:
-            batch_count = x.shape[1]
+        x = tree.map(batch_rearrange, x)
+        y = tree.map(batch_rearrange, y)
 
         # Batch scan
         if batch_scan:
             @nnx.scan(in_axes=0, out_axes=0)
-            def batch_scanner(dataset: Dataset, labels: Labels):
-                return self.train_step(dataset, labels)
+            def batch_scanner(xx, yy):
+                return self.train_step(xx, yy)
             return batch_scanner(x, y)
+
         else:
             losses = []
             metrics = []
-            progbar = tqdm(zip(x, y), total=batch_count)
-            for n, (xx, yy) in enumerate(progbar):
-                loss, mets = self.train_step(xx, yy)
-                if jnp.isnan(loss):
-                    raise ValueError("NaN loss")
-                self.print_bacth_stats(progbar, loss, mets)
+
+            if progbar is None:
+                progbar = tqdm(total=len(x))
+            else:
+                progbar.reset(total=len(x))
+
+            for n in range(len(x)):
+                progbar.update()
+
+                loss, mets = self.train_step(x[n], y[n])
+
+                if not jnp.isfinite(loss):
+                    raise ValueError("{loss} LOSS")
+
                 losses.append(loss)
                 metrics.append(mets)
+
+                self.update_batch_progbar(progbar, loss, mets)
+
             return jnp.array(losses), metrics # reduce metrics
 
-    def print_bacth_stats(self, progbar, loss, metrics):
-        progbar.set_description(f"Loss: {loss:.3f}")
 
     @nnx.jit
     def train_step(self, x, y):
-
         def loss_fn(model):
             loss = model.loss(x, y)
-
             safe_loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
-
             return safe_loss, (loss, nnx.pop(model, nl.Metric))
 
-        # batch_scan
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
         (_, (loss, metrics)), grad = grad_fn(self.model)
-
         self.optimizer.update(grad)
-
         return loss, metrics
-
-
-def categorical_crossentropy(logits, labels, mask, eps=1e-6):
-    return -jnp.mean(jnp.sum(labels * jnp.log(logits + eps), axis=-1) * mask)
-
-
-if __name__ == "__main__":
-    from neuralab.model.hercules.h0 import H0
-
-    ds = Dataset.load("default-fit")
-    # ds = ds[:2**14].split_concat(8)
-
-    rngs = nnx.Rngs(0)
-    model = H0(rngs=rngs)
-    trainer = Trainer(model, rngs=rngs)
-    # %%
-    loss, metrics = trainer(ds)
-
-# %%

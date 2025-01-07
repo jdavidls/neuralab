@@ -173,13 +173,17 @@ if __name__ == "__main__":
     loss, metrics, x, y = trainer(
         dataset,
         epochs=1000,
+        batch_size=4,
         #batch_slice=slice(0, 8),
     )
     nnx.display(model)
 
     # %%
 
-    logits, diffusion, feat = model(dataset[:, 2:3])
+    i = 10
+    logits, diffusion, feat = model(x[:, i:i+1])
+    cats = y[:, i:i+1].cats
+    mask = y[:, i:i+1].mask
 
     plt.pcolormesh(rearrange(diffusion[..., 0:1, :], "t b m f -> t (b m f)"))
     plt.colorbar()
@@ -192,6 +196,11 @@ if __name__ == "__main__":
     plt.pcolormesh(rearrange(logits, "t b m a -> t (b m a)"))
     plt.colorbar()
     plt.show()
+
+    plt.pcolormesh(rearrange(cats * mask[..., None], "t b m a -> t (b m a)"))
+    plt.colorbar()
+    plt.show()
+
 
     # %%
     labels = trainer.get_labels()
