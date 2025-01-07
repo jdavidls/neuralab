@@ -20,6 +20,7 @@ tqdm = "^4.67.1"
 optax = "^0.2.4"
 flax = "^0.10.2"
 jaxtyping = "^0.2.36"
+pyarrow = "^18.1.0"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

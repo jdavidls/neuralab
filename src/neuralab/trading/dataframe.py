@@ -153,7 +153,7 @@ def fetch_dataframes(
                     try:
                         return pd.read_parquet(local_path)
                     except Exception as e:
-                        log.warning(f"Failed reading {local_path}")
+                        log.warning(f"Failed reading {local_path} {e}")
                         pass
 
                 content = loader.download(
@@ -181,7 +181,7 @@ def fetch_dataframes(
                     try:
                         return pd.read_parquet(local_path)
                     except Exception as e:
-                        log.warning(f"Failed reading {local_path}")
+                        log.warning(f"Failed reading {local_path}: {e}")
                         pass
 
                 full_df = ensure_full_dataframe(ref)

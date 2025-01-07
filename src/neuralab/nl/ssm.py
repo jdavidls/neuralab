@@ -116,7 +116,7 @@ class Mamba(nnx.Module):
     class Settings:
         num_features: Annotated[int, "F"]
         expand: Annotated[int, "E"] = 2
-        ssm_dim: Annotated[int, "N"] = 16
+        ssm_dim: Annotated[int, "N"] = 32
         kernel_size: int = 4
         use_proj_bias: bool = False
         use_conv_bias: bool = True

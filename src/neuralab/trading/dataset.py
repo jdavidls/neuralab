@@ -39,11 +39,16 @@ def last_power_of_two(x: int):
     return 2 ** int(jnp.log2(x))
 
 
-_DEFAULTS = {
+KNOW_DATASETS = {
     "default": lambda: Dataset.fetch().with_weights,
     "default-fit": lambda: (
         Dataset.load("default").split_concat(32)[: 2**14].split_concat(8).with_trends
     ),
+
+    "tiny-fit": lambda: (
+        Dataset.load("default-fit").split_concat(2).with_trends
+    ),
+
 }
 
 
@@ -53,9 +58,18 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
     returns: jnp.ndarray
     diff_log_price: jnp.ndarray
     log_volume: jnp.ndarray
-    log_imbalance: jnp.ndarray
+    log_ask_volume: jnp.ndarray
+    log_bid_volume: jnp.ndarray
+    
+    @property
+    def log_imbalance(self):
+        return self.log_ask_volume - self.log_bid_volume
 
+
+    
     weights: Optional[jnp.ndarray] = None  # weights
+
+            #log_imbalance=jnp.log1p(ask_vol) - jnp.log1p(bid_vol),
 
     @property
     def shape(self):
@@ -81,8 +95,8 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
         for i in range(len(self)):
             yield self[i]
 
-    def __getitem__(self, args) -> Dataset:
-        return tree.map(lambda v: v.__getitem__(args), self)
+    def __getitem__(self, *args) -> Dataset:
+        return tree.map(lambda v: v.__getitem__(*args), self)
 
     def features(self, *feature_names: Feature, axis=-1):
         return jnp.stack(
@@ -126,7 +140,9 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
             returns=jnp.diff(log_price, append=log_price[-1:], axis=0),
             diff_log_price=jnp.diff(log_price, prepend=log_price[:1], axis=0),
             log_volume=jnp.log1p(vol),
-            log_imbalance=jnp.log1p(ask_vol) - jnp.log1p(bid_vol),
+            log_ask_volume=jnp.log1p(ask_vol),
+            log_bid_volume=jnp.log1p(bid_vol),
+
         )
 
     @classmethod
@@ -178,10 +194,10 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
                 return dataset
 
         except FileNotFoundError:
-            if name not in _DEFAULTS:
+            if name not in KNOW_DATASETS:
                 raise
 
-        ds_builder = _DEFAULTS[name]
+        ds_builder = KNOW_DATASETS[name]
         dataset = ds_builder()
         dataset.save(name)
         return dataset

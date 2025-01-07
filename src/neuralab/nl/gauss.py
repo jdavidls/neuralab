@@ -14,7 +14,7 @@ from neuralab.nl.common import Loss
 
 LOG_TAU = jnp.log(2 * jnp.pi)
 
-
+# Gaussian Attention
 
 def log_emission_prob(
     obs: Float[Array, "D"], 

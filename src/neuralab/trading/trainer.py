@@ -27,11 +27,10 @@ class Labels(struct.PyTreeNode):
 
     def __getitem__(self, *args) -> Dataset:
         return tree.map(lambda v: v.__getitem__(*args), self)
-    
+
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
-
 
 
 class Trainer(nnx.Module):
@@ -83,7 +82,7 @@ class Trainer(nnx.Module):
             side_trend_idx = self.is_side_trend(trends)
             up_trend_idx = (~side_trend_idx) & (trends.direction > 0)
             down_trend_idx = (~side_trend_idx) & (trends.direction < 0)
-            return side_trend_idx, up_trend_idx, down_trend_idx
+            return up_trend_idx, side_trend_idx, down_trend_idx
 
     def __init__(self, model, settings: Settings = Settings(), rngs=nnx.Rngs(0)):
         self.settings = settings
@@ -91,28 +90,25 @@ class Trainer(nnx.Module):
         self.model = model
         self.optimizer = nnx.Optimizer(model, optax.nadam(1e-3))
 
-    @nnx.jit
-    def eval_step(self, dataset: Dataset): ...
+    # @nnx.jit
+    def get_labels(self, dataset):
 
-    def set_fit_dataset(self, dataset: Dataset):
-        self.fit_dataset = nnx.Cache(dataset)
+        all_trends = dataset.trends
 
         up_trend_idx, side_trend_idx, down_trend_idx = (
             self.settings.categorical_trend_indices(dataset.trends)
         )
 
-        self.all_trends = nnx.Cache(dataset.trends)
-        trend_scores = nnx.Cache(self.settings.trend_initial_scores(dataset.trends))
-        self.up_trends = nnx.Cache(dataset.trends[up_trend_idx])
-        self.side_trends = nnx.Cache(dataset.trends[side_trend_idx])
-        self.down_trends = nnx.Cache(dataset.trends[down_trend_idx])
-        self.up_trend_scores = nnx.Cache(trend_scores[up_trend_idx])
-        self.side_trend_cores = nnx.Cache(trend_scores[side_trend_idx])
-        self.down_trend_scores = nnx.Cache(trend_scores[down_trend_idx])
+        trend_scores = self.settings.trend_initial_scores(dataset.trends)
 
-    #@nnx.jit
-    def get_labels(self):
-        mask = jnp.zeros(self.fit_dataset.shape)
+        up_trends = dataset.trends[up_trend_idx]
+        side_trends = dataset.trends[side_trend_idx]
+        down_trends = dataset.trends[down_trend_idx]
+        up_trend_scores = trend_scores[up_trend_idx]
+        side_trend_cores = trend_scores[side_trend_idx]
+        down_trend_scores = trend_scores[down_trend_idx]
+
+        mask = jnp.zeros(dataset.shape)
 
         def categorical_label(trends: Trends, trend_scores: jnp.ndarray):
             nonlocal mask
@@ -123,16 +119,16 @@ class Trainer(nnx.Module):
                 -trend_scores
             )
 
-            label = jnp.zeros(self.fit_dataset.shape)
+            label = jnp.zeros(dataset.shape)
             label = label.at[trends.start_at, trends.batch, trends.market].add(1)
             label = label.at[trends.stop_at, trends.batch, trends.market].add(-1)
             return jnp.cumsum(label, axis=0)
 
         labels = jnp.stack(
             [
-                categorical_label(self.up_trends.value, self.up_trend_scores.value),
-                categorical_label(self.side_trends.value, self.side_trend_cores.value),
-                categorical_label(self.down_trends.value, self.down_trend_scores.value),
+                categorical_label(up_trends, up_trend_scores),
+                categorical_label(side_trends, side_trend_cores),
+                categorical_label(down_trends, down_trend_scores),
             ],
             axis=-1,
         )
@@ -145,70 +141,92 @@ class Trainer(nnx.Module):
         eval_dataset: Optional[Dataset] = None,
         epochs: int = 1,
         batch_size: int = 2,
+        batch_slice: Optional[slice] = None,
+        batch_scan: bool = False,
     ):
-        self.set_fit_dataset(fit_dataset)
-
         loss, metrics = None, None
+        x = fit_dataset
+        y = self.get_labels(fit_dataset)
+
         try:
             progbar = trange(epochs)
 
             for epoch in progbar:
-                loss, metrics = self.batched_training(batch_size=batch_size)
 
-                progbar.set_description(f"Loss: {loss}")
+                loss, metrics = self.epoch(x, y,
+                    batch_size=batch_size,
+                    batch_slice=batch_slice,
+                    batch_scan=batch_scan,
+                )
 
-                if eval_dataset is not None:
-                    self.eval_step(eval_dataset)
+                progbar.set_description(f"Loss: {jnp.mean(loss):.3f}")
+                # if eval_dataset is not None:
+                # self.eval_step(eval_dataset)
+
         except KeyboardInterrupt:
             pass
 
-        return loss, metrics
+        return loss, metrics, x, y
 
-    def batched_training(self, *, batch_size, use_scan=False, batch_skip=0):
+    def epoch(
+        self,
+        x,
+        y,
+        *,
+        batch_size=None,
+        batch_slice=None,
+        batch_scan=False,
+        batch_permute=True,
+        batch_axis=1,
+    ):
 
-        x = self.fit_dataset
-        y = self.get_labels()
+        # Batch slice
+        if batch_slice is not None:
+            x = x[:, batch_slice]
+            y = y[:, batch_slice]
 
-        perm = random.permutation(self.rngs.train(), x.shape[1])
-        x = tree.map(lambda v: v[:, perm], x)
-        y = tree.map(lambda v: v[:, perm], y)
+        # batch permutation
+        if batch_permute:
+            perm = random.permutation(self.rngs.train(), x.shape[1])
+            x = tree.map(lambda v: v[:, perm], x)
+            y = tree.map(lambda v: v[:, perm], y)
 
-        assert x.shape[1] % batch_size == 0
-        batch_count = x.shape[1] // batch_size
+        # batch rearrange
+        if batch_size is not None:
+            assert x.shape[1] % batch_size == 0
+            batch_count = x.shape[1] // batch_size
 
-        def batch_rearrange(x):
-            return rearrange(
-                x, "t (bl bc) ... -> bc t bl ...", bl=batch_size, bc=batch_count
-            )
+            def batch_rearrange(x):
+                return rearrange(
+                    x, "t (bl bc) ... -> bc t bl ...", bl=batch_size, bc=batch_count
+                )
 
-        x = tree.map(batch_rearrange, x)
-        y = tree.map(batch_rearrange, y)
+            x = tree.map(batch_rearrange, x)
+            y = tree.map(batch_rearrange, y)
+        else:
+            batch_count = x.shape[1]
 
-        if use_scan:
+        # Batch scan
+        if batch_scan:
             @nnx.scan(in_axes=0, out_axes=0)
-            def batch_scan(dataset: Dataset, labels: Labels):
+            def batch_scanner(dataset: Dataset, labels: Labels):
                 return self.train_step(dataset, labels)
-
-            return batch_scan(x, y)
+            return batch_scanner(x, y)
         else:
             losses = []
             metrics = []
             progbar = tqdm(zip(x, y), total=batch_count)
             for n, (xx, yy) in enumerate(progbar):
-                if n < batch_skip:
-                    continue
-
                 loss, mets = self.train_step(xx, yy)
                 if jnp.isnan(loss):
                     raise ValueError("NaN loss")
                 self.print_bacth_stats(progbar, loss, mets)
                 losses.append(loss)
                 metrics.append(mets)
-
-            return jnp.array(losses), metrics
+            return jnp.array(losses), metrics # reduce metrics
 
     def print_bacth_stats(self, progbar, loss, metrics):
-        progbar.set_description(f"Loss: {loss:.2f}")
+        progbar.set_description(f"Loss: {loss:.3f}")
 
     @nnx.jit
     def train_step(self, x, y):
@@ -224,11 +242,10 @@ class Trainer(nnx.Module):
         grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
         (_, (loss, metrics)), grad = grad_fn(self.model)
 
-
-
         self.optimizer.update(grad)
 
         return loss, metrics
+
 
 def categorical_crossentropy(logits, labels, mask, eps=1e-6):
     return -jnp.mean(jnp.sum(labels * jnp.log(logits + eps), axis=-1) * mask)
@@ -238,12 +255,12 @@ if __name__ == "__main__":
     from neuralab.model.hercules.h0 import H0
 
     ds = Dataset.load("default-fit")
-    #ds = ds[:2**14].split_concat(8)
+    # ds = ds[:2**14].split_concat(8)
 
     rngs = nnx.Rngs(0)
     model = H0(rngs=rngs)
     trainer = Trainer(model, rngs=rngs)
-    #%%
+    # %%
     loss, metrics = trainer(ds)
 
 # %%
