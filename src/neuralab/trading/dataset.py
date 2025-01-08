@@ -4,7 +4,7 @@ from __future__ import annotations
 import pickle
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, overload
 from weakref import WeakValueDictionary
 
 import optax
@@ -13,7 +13,7 @@ from jax import numpy as jnp
 from jax import random, tree
 from jaxtyping import Array, Float, Int
 from pandas import DataFrame
-from tqdm.notebook import tqdm, trange
+from tqdm.notebook import tqdm
 
 from neuralab import fn
 from neuralab.trading.dataframe import (
@@ -24,7 +24,7 @@ from neuralab.trading.dataframe import (
     Symbol,
     fetch_dataframes,
 )
-from neuralab.utils.timeutils import TimeRange
+from neuralab.utils.timeutils import TimeRange, TimeRangeParseable
 
 NL_HOME_PATH = Path.home() / ".neuralab"
 
@@ -35,52 +35,48 @@ type Feature = Literal[
 _loaded_datasets: WeakValueDictionary[str, Dataset] = WeakValueDictionary()
 
 
-def last_power_of_two(x: int):
-    return 2 ** int(jnp.log2(x))
-
-
 KNOW_DATASETS = {
-    "default": lambda: Dataset.fetch().with_weights,
-    "default-fit": lambda: (
-        Dataset.load("default").split_concat(32)[: 2**14].split_concat(8).with_trends
-    ),
-
-    "tiny-fit": lambda: (
-        Dataset.load("default-fit").split_concat(2).with_trends
-    ),
-
+    "2022": lambda: Dataset.fetch("2022 1m").with_weights,
+    "2023": lambda: Dataset.fetch("2023 1m").with_weights,
+    "2024": lambda: Dataset.fetch("2024 1m").with_weights,
+    "2022-tiny": lambda: Dataset.load("2022").fix_for_batch("tiny"),
+    "2023-tiny": lambda: Dataset.load("2023").fix_for_batch("tiny"),
+    "2024-tiny": lambda: Dataset.load("2024").fix_for_batch("tiny"),
+    "2022-to-2023-tiny": lambda: Dataset.concat(
+        [
+            Dataset.load("2022-tiny"),
+            Dataset.load("2023-tiny"),
+        ]
+    ).with_trends,
+    "default": lambda: Dataset.load("2022-to-2023-tiny").with_weights,
 }
 
 
 @struct.dataclass
 class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!!
-    log_price: jnp.ndarray
-    returns: jnp.ndarray
-    diff_log_price: jnp.ndarray
-    log_volume: jnp.ndarray
-    log_ask_volume: jnp.ndarray
-    log_bid_volume: jnp.ndarray
-    
+    log_price: Float[Array, "time asset market"]
+    returns: Float[Array, "time asset market"]
+    diff_log_price: Float[Array, "time asset market"]
+    log_volume: Float[Array, "time asset market"]
+    log_ask_volume: Float[Array, "time asset market"]
+    log_bid_volume: Float[Array, "time asset market"]
+
     @property
-    def log_imbalance(self):
+    def log_imbalance(self) -> Float[Array, "time asset market"]:
         return self.log_ask_volume - self.log_bid_volume
 
-
-    
-    weights: Optional[jnp.ndarray] = None  # weights
-
-            #log_imbalance=jnp.log1p(ask_vol) - jnp.log1p(bid_vol),
+    weights: Optional[Float[Array, "time asset market"]] = None  # weights
 
     @property
     def shape(self):
         return self.log_price.shape
 
     @cached_property
-    def with_weights(self):  # TODO: tags seran renombrados por weights
+    def with_weights(self):
         return self if self.weights is not None else fit_weights(self)
 
     @property
-    def with_trends(self):  # TODO: tags seran renombrados por weights
+    def with_trends(self):
         _ = self.trends
         return self
 
@@ -98,10 +94,13 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
     def __getitem__(self, *args) -> Dataset:
         return tree.map(lambda v: v.__getitem__(*args), self)
 
-    def features(self, *feature_names: Feature, axis=-1):
+    def timeseries(self, *feature_names: Feature, axis=-1):
         return jnp.stack(
             [getattr(self, feature) for feature in feature_names], axis=axis
         )
+
+    def fix_for_batch(self, mode="tiny"):
+        return self.with_weights.split_concat(32)[: 2**14].split_concat(8).with_trends
 
     @staticmethod
     def concat(datasets: list[Dataset], axis=1):
@@ -142,27 +141,65 @@ class Dataset(struct.PyTreeNode):  # un dataset es un modulo porque tiene pesos!
             log_volume=jnp.log1p(vol),
             log_ask_volume=jnp.log1p(ask_vol),
             log_bid_volume=jnp.log1p(bid_vol),
-
         )
+
+    @overload
+    @classmethod
+    def fetch(
+        cls,
+        time_range: TimeRangeParseable = DEFAULT_TIME_RANGE,
+        symbols: list[Symbol] = DEFAULT_SYMBOLS,
+        markets: list[Market] = DEFAULT_MARKETS,
+        *,
+        only_ensure: Literal[False] = False,
+    ) -> Dataset: ...
+
+    @overload
+    @classmethod
+    def fetch(
+        cls,
+        time_range: TimeRangeParseable = DEFAULT_TIME_RANGE,
+        symbols: list[Symbol] = DEFAULT_SYMBOLS,
+        markets: list[Market] = DEFAULT_MARKETS,
+        *,
+        only_ensure: Literal[True] = True,
+    ) -> None: ...
 
     @classmethod
     def fetch(
         cls,
-        time_range: TimeRange = DEFAULT_TIME_RANGE,
+        time_range: TimeRangeParseable = DEFAULT_TIME_RANGE,
         symbols: list[Symbol] = DEFAULT_SYMBOLS,
         markets: list[Market] = DEFAULT_MARKETS,
-    ):
-        dfs = fetch_dataframes(time_range, symbols, markets)
+        *,
+        only_ensure=False,
+    ) -> Optional[Dataset]:
+        time_range = TimeRange.of(time_range)
+        try:
+            cls.load(str(time_range))
+        except FileNotFoundError:
+            pass
 
-        return cls.concat(
+        dataframes = fetch_dataframes(
+            time_range, symbols, markets, only_ensure=only_ensure
+        )
+
+        if only_ensure or dataframes is None:
+            return
+
+        dataset = cls.concat(
             [
                 cls.concat(
                     [cls.from_dataframe(df) for df in df_by_mkt.values()], axis=1
                 )
-                for df_by_mkt in dfs.values()
+                for df_by_mkt in dataframes.values()
             ],
             axis=2,
         )
+
+        dataset.save(str(time_range))
+
+        return dataset
 
     def save(self, name: str):
         global _loaded_datasets
@@ -281,8 +318,8 @@ class Trends(struct.PyTreeNode):
 
 
 def fit_weights(
-    dataset,
-    weights: Optional[jnp.ndarray] = None,
+    dataset: Dataset,
+    # weights: Optional[jnp.ndarray] = None,
     epochs=1000,
     lr=1e-2,
     mode="max_total_perf",
@@ -311,23 +348,24 @@ def fit_weights(
         return opt_state, weights, loss, jnp.std(grads)
 
     try:
-        tqdm = trange(epochs)
-        for n in tqdm:
+        progbar = tqdm(total=epochs)
+        for n in range(epochs):
+            opt_state, weights, loss, g_std = fit_step(opt_state, weights, dataset)
+
             if n % 25 == 0:
                 s = sim(dataset, eval_activation(weights))
                 perf = jnp.mean(s.total_performance)
                 cost = jnp.mean(s.total_transaction_cost)
                 turnover = jnp.mean(s.total_turnover)
+                w_std = jnp.std(weights)  # type: ignore
 
-            opt_state, weights, loss, g_std = fit_step(opt_state, weights, dataset)
-            w_std = jnp.std(weights)
-
-            tqdm.set_description(
+            progbar.update()
+            progbar.set_description(
                 f"Gain: {-loss:.2f} "
-                f"Perf: {perf:.2f} "
-                f"Cost: {cost:.2f} "
-                f"Turnover: {turnover:.0f} "
-                f"Weights: ±{w_std:.2f}"
+                f"Perf: {perf:.2f} "  # type: ignore
+                f"Cost: {cost:.2f} "  # type: ignore
+                f"Turnover: {turnover:.0f} "  # type: ignore
+                f"Weights: ±{w_std:.2f}"  # type: ignore
             )
 
     except KeyboardInterrupt:
@@ -336,5 +374,3 @@ def fit_weights(
     return dataset.replace(weights=weights)
 
 
-if __name__ == "__main__":
-    ds = Dataset.load()

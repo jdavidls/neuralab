@@ -4,7 +4,7 @@ This module contains the Trainer class, which is responsible for training the mo
 """
 
 # %%
-from math import isnan
+from __future__ import annotations
 from typing import Optional
 from einops import rearrange
 import optax
@@ -25,7 +25,7 @@ class Labels(struct.PyTreeNode):
     def __len__(self):
         return len(self.cats)
 
-    def __getitem__(self, *args) -> Dataset:
+    def __getitem__(self, *args) -> Labels:
         return tree.map(lambda v: v.__getitem__(*args), self)
 
     def __iter__(self):
@@ -136,16 +136,17 @@ class Trainer(nnx.Module):
         return Labels(labels, jnp.cumsum(mask, axis=0))
 
     def update_epoch_progbar(self, progbar, loss, metrics):
-        progbar.set_description(f"EPOCH Loss: {jnp.mean(loss):.3f}")
+        progbar.set_description(f"[EPOCH] Loss: {jnp.mean(loss):.3f}")
 
     def update_batch_progbar(self, progbar, loss, metrics):
-        progbar.set_description(f"BATCH Loss: {loss:.3f}")
+        progbar.set_description(f"[BATCH] Loss: {loss:.3f}")
 
     def __call__(
         self,
         fit_dataset: Dataset,
         eval_dataset: Optional[Dataset] = None,
         epochs: int = 1,
+        display_every: int = 100,
         batch_size: int = 1,
         batch_slice: Optional[slice] = None,
         batch_scan: bool = False,
@@ -159,8 +160,6 @@ class Trainer(nnx.Module):
             batch_progbar = tqdm()
 
             for epoch in range(epochs):
-                epoch_progbar.update()
-                self.update_epoch_progbar(epoch_progbar, loss, metrics)
 
                 loss, metrics = self.epoch(x, y,
                     batch_size=batch_size,
@@ -169,6 +168,11 @@ class Trainer(nnx.Module):
                     progbar=batch_progbar,
                 )
 
+                epoch_progbar.update()
+                self.update_epoch_progbar(epoch_progbar, loss, metrics)
+
+                if epoch % display_every == 0:
+                    nnx.display(self.model)
 
                 # if eval_dataset is not None:
                 # self.eval_step(eval_dataset)
@@ -176,6 +180,7 @@ class Trainer(nnx.Module):
         except KeyboardInterrupt:
             pass
 
+        nnx.display(self.model)
         return loss, metrics, x, y
 
     def epoch(

@@ -100,6 +100,8 @@ def sim(
     params: SimParams = SimParams(),
 ) -> SimMetrics:
     """Simulate single asset portfolio"""
+    t, a, m, *head_shape = weights.shape
+    
 
     # if params.max_leverage is not None:
     # weights *= 1e1
