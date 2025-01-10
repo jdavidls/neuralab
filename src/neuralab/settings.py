@@ -1,11 +1,13 @@
+import os
 from pathlib import Path
-from typing import Optional
+from logging import getLogger as get_logger
 
 NEURALAB_HOME_PATH = Path.home() / ".neuralab"
 # settings
-NEURALAB_BUCKET_NAME = "neuralab"
+NEURALAB_BUCKET_NAME = "neuralab-storage"
 NEURALAB_LOCAL_STORAGE_PATH = Path.home() / ".neuralab"
 
+DEFAULT_NUM_WORKERS = min((os.cpu_count() or 1) + 4, 32)
 
 
 def storage_path(obj_or_cls: object | type, *parts: str) -> Path:

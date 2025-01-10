@@ -22,7 +22,7 @@ from neuralab.trading.dataframe import (
     DEFAULT_TIME_RANGE,
     Market,
     Symbol,
-    fetch_dataframes,
+    TradeSampleDataFrame,
 )
 from neuralab.utils.timeutils import TimeRange, TimeRangeParseable
 
@@ -324,7 +324,7 @@ def fit_weights(
     lr=1e-2,
     mode="max_total_perf",
 ):
-    from neuralab.trading.sim import SimParams, sim
+    from neuralab.trading.sim import SimParams, simulation
 
     weights = dataset.returns
 
@@ -339,7 +339,7 @@ def fit_weights(
     def fit_step(opt_state, weights, dataset):
 
         def loss_fn(weights):
-            return sim(dataset, fit_activation(weights), params=sim_params).loss(mode)
+            return simulation(dataset, fit_activation(weights), settings=sim_params).loss(mode)
 
         loss, grads = nnx.value_and_grad(loss_fn)(weights)
         updates, opt_state = opt.update(grads, opt_state)
@@ -353,7 +353,7 @@ def fit_weights(
             opt_state, weights, loss, g_std = fit_step(opt_state, weights, dataset)
 
             if n % 25 == 0:
-                s = sim(dataset, eval_activation(weights))
+                s = simulation(dataset, eval_activation(weights))
                 perf = jnp.mean(s.total_performance)
                 cost = jnp.mean(s.total_transaction_cost)
                 turnover = jnp.mean(s.total_turnover)

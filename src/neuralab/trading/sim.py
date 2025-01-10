@@ -29,23 +29,26 @@ class RiskControl:
     confidence_level: float = 0.95  # 95% confidence level
 
 
-@dataclass
-class SimParams:
-    transaction_cost: float = 0.001
-    max_leverage: Optional[float] = 5.0
-    risk_ctrl: Optional[RiskControl] = None
-
 
 @struct.dataclass
-class SimMetrics(struct.PyTreeNode):
+class Simulation(struct.PyTreeNode):
+
+    @dataclass
+    class Settings:
+        transaction_cost: float = 0.001
+        max_leverage: Optional[float] = 5.0
+        risk_ctrl: Optional[RiskControl] = None
+
+
+
     dataset: Dataset
-    params: SimParams = struct.field(pytree_node=False)
+    settings: Settings = struct.field(pytree_node=False)
     turnover: jnp.ndarray
     returns: jnp.ndarray
 
     @property
     def transaction_cost(self):
-        return jnp.log1p(self.turnover * self.params.transaction_cost)
+        return jnp.log1p(self.turnover * self.settings.transaction_cost)
 
     @property
     def total_turnover(self):
@@ -93,37 +96,49 @@ def calculate_risk_metrics(returns: jnp.ndarray, confidence_level: float = 0.95)
     return var, max_drawdown
 
 
-def sim(
+def simulation(
     dataset: Dataset,
-    weights: jnp.ndarray,  ## can be
+    logits: jnp.ndarray,  ## can be
     *,
-    params: SimParams = SimParams(),
-) -> SimMetrics:
+    settings: Simulation.Settings = Simulation.Settings(),
+) -> Simulation:
     """Simulate single asset portfolio"""
-    t, a, m, *head_shape = weights.shape
-    
+    t, a, m, *head_shape = logits.shape
 
-    # if params.max_leverage is not None:
-    # weights *= 1e1
+    match head_shape:
+        case ():
+            probs = nnx.hard_sigmoid(logits)
+            turnover = jnp.abs(jnp.diff(probs, append=logits[-1:], axis=0))
+            returns = jnp.clip(probs, 0, 1) * dataset.returns
 
-    turnover = jnp.abs(jnp.diff(weights, append=weights[-1:], axis=0))
+        case (3,):
+            probs = nnx.softmax(logits)  # log_softmax??
 
-    # if params.portfolio_mode is True:
-    # turnover = jnp.sum(turnover, axis=1, keepdims=True)
+            probs_out = probs[:, :, :, 1]
+            probs_long = probs[:, :, :, 0]
+            probs_short = probs[:, :, :, 2]
+        
+            turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp.abs(jnp.diff(probs_short, axis=0))
+            returns = probs_long * dataset.returns - probs_short * dataset.returns
 
-    # total_turnover = jnp.sum(turnover, axis=0)
-    # log_costs = jnp.log1p(-total_turnover * params.transaction_cost)
+        case (4,):
+            leverage, logits = logits[..., 0], logits[..., 1:4]
+            leverage = nnx.sigmoid(leverage) * settings.max_leverage
 
-    returns = jnp.clip(weights, 0, 1) * dataset.returns
+            probs = nnx.softmax(logits)
 
-    # print(log_costs.shape)
+            probs_out = probs[:, :, :, 1]
+            probs_long = probs[:, :, :, 0] * leverage
+            probs_short = probs[:, :, :, 2] * leverage
+        
+            turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp.abs(jnp.diff(probs_short, axis=0))
+            returns = probs_long * dataset.returns - probs_short * dataset.returns
+        case _:
+            raise ValueError(f"Invalid logits shape: {logits.shape}")
 
-    if params.risk_ctrl is not None:
-        ...
-
-    return SimMetrics(
+    return Simulation(
+        settings=settings,
         dataset=dataset,
-        params=params,
         turnover=turnover,
         returns=returns,
     )
@@ -178,7 +193,7 @@ def fit_labels(
     def fit_step(opt_state, labels, dataset):
 
         def loss_fn(labels):
-            return sim(dataset, fit_activation(labels), params=sim_params).loss(mode)
+            return simulation(dataset, fit_activation(labels), settings=sim_params).loss(mode)
 
         loss, grads = nnx.value_and_grad(loss_fn)(labels)
         updates, opt_state = opt.update(grads, opt_state)
@@ -190,7 +205,7 @@ def fit_labels(
         tqdm = trange(epochs)
         for n in tqdm:
             if n % 25 == 0:
-                s = sim(dataset, eval_activation(labels))
+                s = simulation(dataset, eval_activation(labels))
                 perf = jnp.mean(s.total_performance)
                 cost = jnp.mean(s.total_transaction_cost)
                 turnover = jnp.mean(s.total_turnover)

@@ -1,4 +1,4 @@
-# %%
+# %% Gaussian Self Attention
 
 from typing import Tuple
 
@@ -49,6 +49,8 @@ def log_emission_prob(
     # Final log probability
     return -0.5 * (D * LOG_TAU + log_det + jnp.sum(solve_L**2, axis=-1))
 
+
+## El exponente de la suma acumulaada de log_softmax ( x * A )
 
 def viterbi(
     log_A: Float[Array, "S S"],

@@ -4,12 +4,14 @@ from optax import losses
 from einops import rearrange
 from flax import nnx, struct
 from jax import numpy as jnp
+import numpy as np
 
 import pickle
 from datetime import datetime
 
 from neuralab import nl, settings
 from neuralab.trading.dataset import Dataset, Feature
+from neuralab.trading.sim import simulation
 from neuralab.trading.trainer import Labels, Trainer
 
 
@@ -72,8 +74,12 @@ class H0(Model):
         # num_hmm_layers: int = 4
         # num_hmm_features: int = 3
         # num_hmm_states: int = 8
-
         num_features = 64
+        out_shape = (2, 4,) # [ce/sim, feat]
+
+        @property
+        def num_out_logits(self) -> int:
+            return int(np.prod(self.out_shape))
 
     def __init__(
         self,
@@ -88,20 +94,27 @@ class H0(Model):
             max_t=settings.ema_max_t,
         )
 
-        self.var_norm = nnx.BatchNorm(
-            settings.num_in_timeseries * settings.num_ema_layers, rngs=rngs
-        )
+        self.feed_norm = nnx.BatchNorm(settings.num_feed_features, rngs=rngs)
 
-        self.in_proj = nnx.Linear(
+        self.feed_proj = nnx.Linear(
             in_features=settings.num_feed_features,
             out_features=settings.num_features,
             rngs=rngs,
         )
 
+        self.feat = nl.FeedForward(
+            settings.num_feed_features,
+            settings.num_features * 2,
+            settings.num_features,
+            residual=False,
+            normalization=False,
+            rngs=rngs,
+        )
+
         self.layers = nnx.Sequential(
-            nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
+            # nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
             nl.Mamba.Settings(settings.num_features).build(rngs),
-            nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
+            # nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
         )
 
         # self.hmm = nl.HMM.stack(
@@ -111,14 +124,14 @@ class H0(Model):
         #     rngs=rngs,
         # )
 
-        # self.mamba = nl.Mamba(
-        #     nl.Mamba.Settings(
-        #         num_features=settings.num_features,
-        #     ),
-        #     rngs=rngs,
-        # )
-
-        # self.mamba_norm = nnx.LayerNorm(settings.num_features, rngs=rngs)
+        self.logits = nl.FeedForward(
+            settings.num_features,
+            settings.num_features * 2,
+            settings.num_out_logits,
+            residual=False,
+            normalization=False,
+            rngs=rngs,
+        )
 
         self.logits_proj = nnx.Linear(settings.num_features, 3, rngs=rngs)
 
@@ -127,66 +140,36 @@ class H0(Model):
             *self.settings.in_timeseries, axis=-1
         )  # [time, ..., feature]
 
-        # EM Stats: avg var norm
-        avg, var, nrm = self.ema.norm(x)  # [time, market, ..., feature, ema_layer]
+        # Feed
+        avg, var, nrm = self.ema.norm(x) # EM avg var norm
 
-        # confussion matrixes:
-        # para cada una de las capas de ema:
-        #   crea una matriz diferencial para cada una caracateristicas de entrada
-        #  las ultimas dos capas (ask_vol y bid_vol) son concatenadas antes de crear la matriz
-        #  por lo que tendremos 2 matrices de LxL y una de 2Lx2L
-        #  devolviendo la parte triangular d ela matriz con jnp.triu
-        # F = 2 * sum(range(L)) + sum(range(2*L))
-
-        def diffusion_matrix(x):
+        def diff_matrix(x): # fn.diff_matrix and fn.diff_matrix_output(in) -> out { (in * in - in) / 2 }
             a = x[..., None, :]
             b = x[..., :, None]
             i, j = jnp.triu_indices(x.shape[-1], 1)
             return (a - b)[..., i, j]
 
-        diffusion = jnp.concatenate(
+        feed = jnp.concatenate(
             [
                 rearrange(nrm, "t b m f l -> t b m (f l)"),
-                self.var_norm(rearrange(var, "t b m f l -> t b m (f l)")),
-                diffusion_matrix(avg[..., 0, :]),
-                diffusion_matrix(avg[..., 1, :]),
-                diffusion_matrix(
-                    jnp.concatenate([avg[..., 2, :], avg[..., 3, :]], axis=-1)
-                ),
+                rearrange(var, "t b m f l -> t b m (f l)"),
+                diff_matrix(avg[..., 0, :]),
+                diff_matrix(avg[..., 1, :]),
+                diff_matrix(jnp.concatenate([avg[..., 2, :], avg[..., 3, :]], axis=-1)),
             ],
             axis=-1,
         )
 
-        feat = self.in_proj(diffusion)
+        feed = self.feed_norm(feed)
 
-        # # HMM
-
-        # hmm_axes = nnx.StateAxes({nl.Loss: 1, ...: None})
-        # @nnx.vmap(in_axes=(hmm_axes, 1), out_axes=1)
-        # @nnx.vmap(in_axes=(0, -1), out_axes=-1)
-        # def hmm_vmap(hmm, features):
-        #     return hmm(features)
-
-        # s = hmm_vmap(self.hmm, x)
-
-        # # flatten
-        # x = rearrange(s, "t ... s l -> t ... (s l)")
-
-        # Mamba
+        # Feat
+        feat = self.feed_proj(feed)
         feat = self.layers(feat)
 
-        # Sim
-
-        # TODO: capa final colapsara la dimension de mercado unificando
-        # todas las caracteristicas conjuntas, haciendo un feed forward
-        # para luego componer los logits de cada cabeza de probabilidad
-
-        # otra opcion es utilizar un multihead self attention con N cabezas.
-        # embeddings en Q por mercado (Futures/Spot, binance kraken, etc...),
-
+        # Logits
         logits = self.logits_proj(feat)
 
-        return logits, diffusion, feat
+        return logits, feed, feat
 
     def loss(self, x: Dataset, y: Labels):
         logits, *_ = self(x)
@@ -195,16 +178,17 @@ class H0(Model):
         # loss = jnp.mean((logits - y.cats) ** 2, axis=-1) * y.mask
 
         # CrossEntropy
-        loss = losses.softmax_cross_entropy(logits, y.cats) * y.mask
+        # loss = losses.softmax_cross_entropy(logits, y.cats) * y.mask
+        # return jnp.mean(loss)
 
-        return jnp.mean(loss)
+        return simulation(x, logits).loss()
 
 
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
     # jax.config.update("jax_debug_nans", True)
-    model = H0().load_state("test")
+    model = H0().load_state("training")
     trainer = Trainer(model)
     dataset = Dataset.load()
 
@@ -248,21 +232,18 @@ if __name__ == "__main__":
     probs_short = probs[:, :, :, 2]
     # probs_hold = 1 - (probs_long + probs_out + probs_short)
 
-    turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp(jnp.diff(probs_short, axis=0))
+    turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp.abs(
+        jnp.diff(probs_short, axis=0)
+    )
     returns = probs_long * dataset.returns - probs_short * dataset.returns
 
     plt.plot(jnp.cumsum(returns))
+    plt.show()
+    plt.plot(jnp.cumsum(turnover))
+    plt.show()
 
     # %%
     plt.pcolormesh(y.cats[:, :, 0] * y.mask[:, :, 0, None])
-
-    # %% save model
-    import pickle
-    from datetime import datetime
-
-    model_state = nnx.state(model)
-    with open(f"{datetime.now()}.H0.pkl", "wb") as f:
-        pickle.dump(model_state, f)
 
     # %%
     def plot_behaviour(

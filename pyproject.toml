@@ -5,6 +5,9 @@ description = ""
 authors = ["J.David Luque <jdluque@leitat.org>"]
 readme = "README.md"
 
+[tool.poetry.scripts]
+dataframe = "neuralab.trading.dataframe:cli"
+
 [tool.poetry.dependencies]
 python = "^3.12"
 #flax = "^0.10.2"
@@ -22,6 +25,7 @@ flax = "^0.10.2"
 jaxtyping = "^0.2.36"
 pyarrow = "^18.1.0"
 google-cloud-storage = "^2.19.0"
+typer = "^0.15.1"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"

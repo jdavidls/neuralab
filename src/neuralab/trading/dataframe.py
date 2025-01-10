@@ -2,19 +2,22 @@
 from __future__ import annotations
 
 import gc
-from io import BytesIO
+from abc import ABC
+from dataclasses import dataclass
+from io import BufferedReader, BufferedWriter
+from itertools import product
 from logging import getLogger as get_logger
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple
+from typing import IO, Annotated, Literal
 from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
 import torch as pt
+from typer import Argument, Option, Typer
 
-from neuralab import settings
-from neuralab.utils.loader import Loader
-from neuralab.utils.timeutils import Date, TimeRange, milliseconds
+from neuralab import storage, track
+from neuralab.utils.timeutils import Date, TimeDelta, TimeRange, milliseconds
 
 log = get_logger(__name__)
 
@@ -24,202 +27,173 @@ type Disposition = Literal["sampled", "full"]
 
 DEFAULT_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT"]
 DEFAULT_MARKETS: list[Market] = ["binance-spot", "binance-usdtm"]
-
 DEFAULT_TIME_RANGE = TimeRange.of("2023 1m")
-
-_STORAGE_PATH = Path.home() / ".dataproxy"
-
 COMPRESSION_FORMAT = "gzip"  # {‘snappy’, ‘gzip’, ‘brotli’, ‘lz4’, ‘zstd’}
 
-_TRADE_SOURCE_URL: dict[Market, Callable[[DataFrameRef], str]] = {
-    "binance-spot": lambda ref: f"https://data.binance.vision/data/spot/daily/aggTrades/{ref.symbol}/{ref.symbol}-aggTrades-{ref.date}.zip",
-    "binance-usdtm": lambda ref: f"https://data.binance.vision/data/futures/um/daily/aggTrades/{ref.symbol}/{ref.symbol}-aggTrades-{ref.date}.zip",
-    "binance-coinm": lambda ref: f"https://data.binance.vision/data/futures/cm/daily/aggTrades/{ref.symbol}/{ref.symbol}-aggTrades-{ref.date}.zip",
-}
 
-_BINANCE_SPOT_COL_DTYPES = {
-    "id": np.int64,
-    "price": np.float32,
-    "qty": np.float32,
-    "initial_trade_id": np.int64,
-    "final_trade_id": np.int64,
-    "time": np.int64,
-    "is_bid": np.bool_,
-    "best_match": np.bool_,
-}
-
-_BINANCE_FUT_COL_DTYPES = {
-    "agg_trade_id": np.int64,
-    "price": np.float32,
-    "quantity": np.float32,
-    "first_trade_id": np.int64,
-    "last_trade_id": np.int64,
-    "transact_time": np.int64,
-    "is_buyer_maker": np.bool_,
-}
-
-_BINANCE_FUT_COL_RENAMES = {
-    #"agg_trade_id": "id",
-    "quantity": "qty",
-    "first_trade_id": "initial_trade_id",
-    "last_trade_id": "final_trade_id",
-    "transact_time": "time",
-
-    "is_buyer_maker": "is_bid",
-}
-
-
-def binance_spot_loader(ref: DataFrameRef, content: bytes):
-    with ZipFile(BytesIO(content)) as zip_file:
-        with zip_file.open(f"{ref.symbol}-aggTrades-{ref.date}.csv") as csv:
-            return pd.read_csv(
-                csv,
-                names=list(_BINANCE_SPOT_COL_DTYPES.keys()),
-                dtype=_BINANCE_SPOT_COL_DTYPES,
-                index_col="id",
-            )
-
-
-def binance_fut_loader(ref: DataFrameRef, content: bytes):
-    with ZipFile(BytesIO(content)) as zip_file:
-        with zip_file.open(f"{ref.symbol}-aggTrades-{ref.date}.csv") as csv:
-            return pd.read_csv(
-                csv,
-                names=list(_BINANCE_FUT_COL_DTYPES.keys()),
-                dtype=_BINANCE_FUT_COL_DTYPES,
-                index_col="agg_trade_id",
-                skiprows=1,
-            ).rename(columns=_BINANCE_FUT_COL_RENAMES, errors='raise')
-
-
-_LOADERS = {
-    "binance-spot": binance_spot_loader,
-    "binance-usdtm": binance_fut_loader,
-    "binance-coinm": binance_fut_loader,
-}
-
-
-class DataFrameRef(NamedTuple):
+@dataclass(frozen=True)
+class DataframeResource(storage.Resource, ABC):
     symbol: Symbol
     market: Market
-    date: Date
 
     @property
-    def remote_url(self):
-        return _TRADE_SOURCE_URL[self.market](self)
+    def path_suffix(self):
+        return f".parquet.{COMPRESSION_FORMAT}"
 
-    def local_path(self, disposition: Disposition = "sampled"):
-        return settings.storage_path(
-            pd.DataFrame,
-            disposition,
-            f"{self.market}-{self.symbol.lower()}",
-            self.date.isoformat(),
-        ).with_suffix(
-            f".parquet.{COMPRESSION_FORMAT}",
+    @property
+    def type(self):
+        return pd.DataFrame
+
+    def load(self, buffer: IO[bytes]):
+        return pd.read_parquet(buffer)
+
+    def dump(self, buffer: IO[bytes], res: pd.DataFrame):
+        res.to_parquet(buffer, compression=COMPRESSION_FORMAT)
+
+
+@dataclass(frozen=True)
+class TradeDataFrame(DataframeResource):
+    date: Date
+
+    @classmethod
+    def for_time_range(
+        cls,
+        symbol: Symbol,
+        market: Market,
+        time_range: TimeRange,
+    ):
+        return [
+            TradeDataFrame(symbol, market, day)
+            for day in time_range.replace(step=TimeDelta(days=1))
+        ]
+
+    @property
+    def path(self):
+        return (
+            Path("daily-trade")
+            / f"{self.market}-{self.symbol.lower()}"
+            / self.date.isoformat()
         )
 
-    def load(self, content):
-        return _LOADERS[self.market](self, content)
-
-
-def fetch_dataframes(
-    time_range: TimeRange,
-    symbols: list[Symbol] = DEFAULT_SYMBOLS,
-    markets: list[Market] = DEFAULT_MARKETS,
-    *,
-    disposition: Disposition = "sampled",
-    only_ensure=False,
-    num_workers=16,
-):
-
-    tasks = [
-        DataFrameRef(sym, market, dt)
-        for dt in time_range.dates()
-        for sym in symbols
-        for market in markets
-    ]
-
-    with Loader.pool(f"Fetching dataframes", max_workers=num_workers) as downloader:
-        for ref in tasks:
-
-            def ensure_full_dataframe(ref: DataFrameRef):
-
-                local_path = ref.local_path("full")
-
-                if local_path.exists():
-                    try:
-                        return pd.read_parquet(local_path)
-                    except Exception as e:
-                        log.warning(f"Failed reading {local_path} {e}")
-                        pass
-
-                content = downloader.download(
-                    ref.remote_url, title=f"{ref.symbol} @ {ref.date} {ref.market}"
+    @property
+    def url(self) -> storage.Url:
+        match self.market:
+            case "binance-spot":
+                return storage.Url(
+                    f"https://data.binance.vision/data/spot/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
                 )
-
-                try:
-                    full_df = ref.load(content)
-                except Exception as e:
-                    e.add_note(f"Failed loading {ref.remote_url}")
-                    log.warning(f"Error reading", e)
-                    log.error(e)
-                    raise
-
-                full_df = full_df[["time", "price", "qty", "is_bid"]]
-                full_df.to_parquet(local_path, compression=COMPRESSION_FORMAT)
-                return full_df
-
-            def ensure_sampled_dataframe(ref: DataFrameRef):
-
-                local_path = ref.local_path("sampled")
-
-                if local_path.exists():
-                    try:
-                        return pd.read_parquet(local_path)
-                    except Exception as e:
-                        log.warning(f"Failed reading {local_path}: {e}")
-                        pass
-
-                full_df = ensure_full_dataframe(ref)
-                smp_df = sample_full_dataframe(
-                    full_df, TimeRange.from_date(ref.date, time_range.step)
+            case "binance-usdtm":
+                return storage.Url(
+                    f"https://data.binance.vision/data/futures/um/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
                 )
+            case "binance-coinm":
+                return storage.Url(
+                    f"https://data.binance.vision/data/futures/cm/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
+                )
+            case _:
+                raise ValueError(f"Invalid market {self.market}")
 
-                smp_df.to_parquet(local_path, compression=COMPRESSION_FORMAT)
-                return smp_df
+    @property
+    def column_info(self):
+        match self.market:
+            case "binance-spot":
+                return {
+                    "id": dict(dtype=np.int64),
+                    "price": dict(dtype=np.float32),
+                    "qty": dict(dtype=np.float32),
+                    "initial_trade_id": dict(dtype=np.int64),
+                    "final_trade_id": dict(dtype=np.int64),
+                    "time": dict(dtype=np.int64),
+                    "is_bid": dict(dtype=np.bool_),
+                    "best_match": dict(dtype=np.bool_),
+                }
+            case "binance-usdtm" | "binance-coinm":
+                return {
+                    "agg_trade_id": dict(dtype=np.int64, rename="id"),
+                    "price": dict(dtype=np.float32),
+                    "quantity": dict(dtype=np.float32, rename="qty"),
+                    "first_trade_id": dict(dtype=np.int64, rename="initial_trade_id"),
+                    "last_trade_id": dict(dtype=np.int64, rename="final_trade_id"),
+                    "transact_time": dict(dtype=np.int64, rename="time"),
+                    "is_buyer_maker": dict(dtype=np.bool_, rename="is_bid"),
+                }
+            case _:
+                raise ValueError(f"Invalid market {self.market}")
 
-            def task_wrapper(task, ref):
-                try:
-                    res = task(ref)
+    @property
+    def column_names(self):
+        return list(self.column_info.keys())
 
-                    if only_ensure:
-                        del res
-                        gc.collect()
-                        return ref, None
-    
-                    return ref, res
-                except Exception as e:
-                    log.error(e)
-                    raise
+    @property
+    def column_dtypes(self):
+        return {k: v["dtype"] for k, v in self.column_info.items()}
 
-            match disposition:
-                case "sampled":
-                    downloader.add_task(task_wrapper, ensure_sampled_dataframe, ref)
-                case "full":
-                    downloader.add_task(task_wrapper, ensure_full_dataframe, ref)
+    @property
+    def column_renames(self):
+        return {k: v["rename"] for k, v in self.column_info.items() if "rename" in v}
 
-    results = {ref: df for ref, df in downloader.get_results()}
+    @property
+    def has_head_line(self):
+        match self.market:
+            case "binance-spot":
+                return False
+            case "binance-usdtm" | "binance-coinm":
+                return True
 
-    if only_ensure:
-        return
+    def make(self):
+        csv_filename = f"{self.symbol}-aggTrades-{self.date}.csv"
+        with ZipFile(self.url.download()) as zip_file:
 
-    res = lambda sym, mkt, dt: results[DataFrameRef(sym, mkt, dt)]
-    cat = lambda sym, mkt: pd.concat([res(sym, mkt, dt) for dt in time_range.dates()])
-    mkt = lambda sym: {mkt: cat(sym, mkt) for mkt in markets}
-    return {sym: mkt(sym) for sym in symbols}
+            with track.task(
+                total=zip_file.getinfo(csv_filename).file_size,
+                description=f"Reading CSV {self.url.url}",
+                transient=True,
+            ) as tracker:
+
+                with zip_file.open(csv_filename) as csv:
+                    return pd.read_csv(
+                        tracker.wrap_io("read", csv),
+                        names=self.column_names,
+                        dtype=self.column_dtypes,
+                        #index_col=self.column_names[0],
+                        skiprows=1 if self.has_head_line else 0,
+                    ).rename(columns=self.column_renames, errors="raise")
 
 
-def sample_full_dataframe(
+@dataclass(frozen=True)
+class TradeSampleDataFrame(DataframeResource):
+    time_range: TimeRange
+
+    @property
+    def path(self):
+        return (
+            Path("sampled")
+            / f"{self.market}-{self.symbol.lower()}"
+            / f"{self.time_range}"
+        )
+
+    def make(self):
+        assert self.time_range.is_for_exact_days
+
+        if day := self.time_range.is_for_an_exact_day:
+            trade_df = TradeDataFrame(self.symbol, self.market, day).fetch()
+            sample_df = sample_trade_dataframe(trade_df, self.time_range)
+            del trade_df
+            gc.collect()
+            return sample_df
+
+        daily_dataframes = storage.fetch_tree(
+            [
+                TradeSampleDataFrame(self.symbol, self.market, day_range)
+                for day_range in self.time_range.each(TimeDelta(days=1))
+            ],
+            description=f"Making {self.path}"
+        )
+
+        return pd.concat(daily_dataframes)
+
+
+def sample_trade_dataframe(
     full_df: pd.DataFrame,
     time_range: TimeRange,
 ):
@@ -292,11 +266,54 @@ def sample_full_dataframe(
         }
     )
 
-#%%
+
+cli = Typer(name="dataframe")
+
+
+@cli.command("ensure")
+def ensure(
+    time_range: Annotated[TimeRange, Argument(parser=TimeRange.of)],
+    # symbol: Annotated[Symbol, Argument(parser=str)],
+    # market: Annotated[Market, Argument(parser=str)],
+    disposition: Annotated[Disposition, Option(parser=str)] = "sampled",
+    local: Annotated[bool, Option()] = True,
+    remote: Annotated[bool, Option()] = False,
+    checking: Annotated[bool, Option()] = True,
+):
+    """Ensure the availability of the trade dataframes for the given symbol and market."""
+
+    tasks = list(
+        product(
+            DEFAULT_SYMBOLS,
+            DEFAULT_MARKETS,
+        )
+    )
+
+    match disposition:
+        case "sampled":
+            storage.ensure_tree(
+                [
+                    TradeSampleDataFrame(symbol, market, time_range)
+                    for symbol, market in tasks
+                ],
+                local=local,
+                remote=remote,
+                checking=checking,
+            )
+        case "full":
+            storage.ensure_tree(
+                [
+                    TradeDataFrame(symbol, market, day)
+                    for symbol, market in tasks
+                    for day in time_range.replace(step=TimeDelta(days=1))
+                ],
+                local=local,
+                remote=remote,
+                checking=checking,
+            )
+        case _:
+            raise ValueError(f"Invalid disposition {disposition}")
+
+
 if __name__ == "__main__":
-
-
-    #DataFrameRef("BTCUSDT", "binance-usdtm", Date(2022, 1, 1)).remote_url
-
-    dfs = fetch_dataframes(TimeRange.of("2022 1m"))
-
+    cli()
