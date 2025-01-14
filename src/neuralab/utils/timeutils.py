@@ -15,7 +15,6 @@ import re
 
 type TimeDeltaParseable = int | str | TimeDelta
 type DateTimeParseable = int | str | Date | DateTime
-type TimeRangeParseable = str | TimeRange
 
 
 def milliseconds(time: Date | DateTime | TimeDelta | int) -> int:
@@ -38,11 +37,14 @@ _1_DAY = TimeDelta(days=1)
 _1_DAY_MS = milliseconds(_1_DAY)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TimeRange:
     start: DateTime
     stop: DateTime
     step: TimeDelta = _1_DAY
+
+    type Parseable = str | TimeRange
+
 
     @property
     def is_for_an_exact_day(self) -> Optional[Date]:
@@ -98,7 +100,7 @@ class TimeRange:
         return cls(parse_datetime(start), parse_datetime(stop), parse_timedelta(step))
 
     @classmethod
-    def of(cls, s: TimeRangeParseable):
+    def of(cls, s: Parseable):
         if isinstance(s, TimeRange):
             return s
         if isinstance(s, str):

@@ -4,21 +4,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from functools import wraps
 from threading import Lock
-from typing import IO, Any, Callable, Literal, Optional, cast
+from typing import IO, Any, BinaryIO, Callable, Literal, Optional, cast
 
-from rich import table, progress, style, text, console
-from rich.progress import (
-    BarColumn,
-    DownloadColumn,
-    Progress,
-    ProgressColumn,
-    Task,
-    Text,
-    TextColumn,
-)
+from rich import console, progress, style, table, text
+from rich.progress import BarColumn, Progress, ProgressColumn, Task
 from rich.text import Text as RichText
+from sympy import fu
 
-from neuralab import settings, logging
+from neuralab import logging, settings
 
 type TaskUnit = Literal["byte", "it"]
 
@@ -83,13 +76,15 @@ PROGRESS_KWARGS = dict(
 
 
 @contextmanager
-def _adquire_context():
+def _adquire_progress_context(): # future live context..
     global PROGRESS
     with PROGRESS_LOCK:
         if PROGRESS is None:
             context_owner = True
             progress = Progress(
-                *PROGRESS_ARGS, console=logging.console, **PROGRESS_KWARGS
+                *PROGRESS_ARGS,
+                console=logging.console,
+                **PROGRESS_KWARGS,
             )
             PROGRESS = progress
         else:
@@ -119,13 +114,13 @@ class TaskTracker(ABC):
     progress: Progress
     task_id: Any
 
-    def __init__(self, description: str, transient=False, **kwargs):
-        self.description = Text(description, overflow="crop", no_wrap=False)
-        self.transient = transient
+    def __init__(self, description: str, leave=True, **kwargs):
+        self.description = description
+        self.leave = leave
         self.task_kwargs = kwargs
 
     def __enter__(self):
-        self.context = _adquire_context()
+        self.context = _adquire_progress_context()
         self.progress = self.context.__enter__()
         self.task_id = self.progress.add_task(
             description=self.description,
@@ -138,7 +133,7 @@ class TaskTracker(ABC):
             if exc_type is None:
                 self.update(
                     refresh=True,
-                    visible=not self.transient,
+                    visible=not self.leave,
                     completed=self.progress.tasks[self.task_id].total,
                 )
             else:
@@ -162,11 +157,23 @@ class TaskTracker(ABC):
         assert hasattr(self, "progress"), "TaskTracker is not active"
         return self.progress.console
 
-    def wrap_io[T: IO[bytes]](self, meth: Literal["read", "write"], io_obj: T) -> T:
+    def wrap_io[
+        T: IO[bytes] | BinaryIO
+    ](
+        self,
+        meth: Literal["read", "write"],
+        io_obj: T,
+        total: Optional[int] = None,
+    ) -> T:
         io_wrapper = ObjectWrapper(io_obj)
 
         match meth:
             case "read":
+                return self.progress.wrap_file(
+                    io_obj,  # type: ignore
+                    task_id=self.task_id,
+                    total=total,
+                )  # type: ignore
 
                 @io_wrapper.wraps_method("read")
                 def wrapped_read(*args, **kwargs):
@@ -181,6 +188,7 @@ class TaskTracker(ABC):
                     return data
 
             case "write":
+
                 @io_wrapper.wraps_method("write")
                 def wrapped_write(content, *args, **kwargs):
                     data = io_obj.write(content, *args, **kwargs)
@@ -190,7 +198,7 @@ class TaskTracker(ABC):
             case _:
                 raise ValueError(f"Invalid method {meth}")
 
-        return cast(T, io_wrapper)
+        return io_wrapper  # type: ignore
 
 
 class ObjectWrapper:
@@ -232,6 +240,7 @@ def parallel_map[
     *args,
     description: str,
     num_workers=settings.DEFAULT_NUM_WORKERS,
+    wait_on_exc: bool = False,
     **kwargs,
 ) -> Any:
     _: Any = None
@@ -245,16 +254,18 @@ def parallel_map[
                 for pi in enumerate(items)
             ]
 
-            for result in as_completed(futures):
+            try:
+                for result in as_completed(futures):
+                    if exc := result.exception():
+                        raise exc
 
-                try:
-                    pos, res = result.result()
-                except Exception as e:
-                    executor.shutdown(wait=False)
-                    raise
-
-                results[pos] = res
-                trackbar.update(advance=1)
+                    pos, res = result.result()                    
+                    results[pos] = res
+                    trackbar.update(advance=1)
+                    
+            except:
+                executor.shutdown(wait=wait_on_exc, cancel_futures=True)
+                raise
 
     return results
 

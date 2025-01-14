@@ -8,3 +8,4 @@ from .ssm import *
 from .tri_activation import *
 from .common import *
 from .hmm import *
+from .model import *

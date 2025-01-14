@@ -4,8 +4,6 @@ from __future__ import annotations
 import gc
 from abc import ABC
 from dataclasses import dataclass
-from io import BufferedReader, BufferedWriter
-from itertools import product
 from logging import getLogger as get_logger
 from pathlib import Path
 from typing import IO, Annotated, Literal
@@ -15,24 +13,22 @@ import numpy as np
 import pandas as pd
 import torch as pt
 from typer import Argument, Option, Typer
+from pandas import DataFrame, read_parquet
 
-from neuralab import storage, track
+from neuralab import track
+from neuralab.resource import Resource, Url, ensure_tree, fetch_tree
+from neuralab.trading.knowledge import DEFAULT_MARKETSET, DEFAULT_SYMBOLSET, Market, Symbol
 from neuralab.utils.timeutils import Date, TimeDelta, TimeRange, milliseconds
 
 log = get_logger(__name__)
 
-type Market = Literal["binance-spot", "binance-usdtm", "binance-coinm"]
-type Symbol = str
 type Disposition = Literal["sampled", "full"]
 
-DEFAULT_SYMBOLS: list[Symbol] = ["BTCUSDT", "ETHUSDT"]
-DEFAULT_MARKETS: list[Market] = ["binance-spot", "binance-usdtm"]
-DEFAULT_TIME_RANGE = TimeRange.of("2023 1m")
 COMPRESSION_FORMAT = "gzip"  # {‘snappy’, ‘gzip’, ‘brotli’, ‘lz4’, ‘zstd’}
 
 
 @dataclass(frozen=True)
-class DataframeResource(storage.Resource, ABC):
+class DataframeResource(Resource.Ref[DataFrame], ABC):
     symbol: Symbol
     market: Market
 
@@ -42,13 +38,13 @@ class DataframeResource(storage.Resource, ABC):
 
     @property
     def type(self):
-        return pd.DataFrame
+        return DataFrame
 
     def load(self, buffer: IO[bytes]):
-        return pd.read_parquet(buffer)
+        return read_parquet(buffer)
 
-    def dump(self, buffer: IO[bytes], res: pd.DataFrame):
-        res.to_parquet(buffer, compression=COMPRESSION_FORMAT)
+    def dump(self, buffer: IO[bytes], resource: DataFrame):
+        resource.to_parquet(buffer, compression=COMPRESSION_FORMAT)
 
 
 @dataclass(frozen=True)
@@ -76,18 +72,18 @@ class TradeDataFrame(DataframeResource):
         )
 
     @property
-    def url(self) -> storage.Url:
+    def url(self) -> Url:
         match self.market:
             case "binance-spot":
-                return storage.Url(
+                return Url(
                     f"https://data.binance.vision/data/spot/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
                 )
             case "binance-usdtm":
-                return storage.Url(
+                return Url(
                     f"https://data.binance.vision/data/futures/um/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
                 )
             case "binance-coinm":
-                return storage.Url(
+                return Url(
                     f"https://data.binance.vision/data/futures/cm/daily/aggTrades/{self.symbol}/{self.symbol}-aggTrades-{self.date}.zip"
                 )
             case _:
@@ -141,23 +137,28 @@ class TradeDataFrame(DataframeResource):
                 return True
 
     def make(self):
-        csv_filename = f"{self.symbol}-aggTrades-{self.date}.csv"
-        with ZipFile(self.url.download()) as zip_file:
+        with track.task(
+            total=None,
+            description=f"Reading CSV {self.url.url}",
+        ) as task:
+            try:
+                with ZipFile(self.url.download()) as zip_file:
+                    csv_filename = f"{self.symbol}-aggTrades-{self.date}.csv"
+                    # task.update(total=zip_file.getinfo(csv_filename).file_size)
 
-            with track.task(
-                total=zip_file.getinfo(csv_filename).file_size,
-                description=f"Reading CSV {self.url.url}",
-                transient=True,
-            ) as tracker:
-
-                with zip_file.open(csv_filename) as csv:
-                    return pd.read_csv(
-                        tracker.wrap_io("read", csv),
-                        names=self.column_names,
-                        dtype=self.column_dtypes,
-                        #index_col=self.column_names[0],
-                        skiprows=1 if self.has_head_line else 0,
-                    ).rename(columns=self.column_renames, errors="raise")
+                    with zip_file.open(csv_filename) as csv:
+                        return pd.read_csv(
+                            # task.wrap_io("read", csv),
+                            csv,
+                            names=self.column_names,
+                            dtype=self.column_dtypes,
+                            # index_col=self.column_names[0],
+                            skiprows=1 if self.has_head_line else 0,
+                        ).rename(columns=self.column_renames, errors="raise")
+            except Exception as e:
+                e.add_note(f"Error reading {self.url.url}")
+                task.console.log(f"[red]Error reading CSV[/red] {self.url.url}")
+                raise e
 
 
 @dataclass(frozen=True)
@@ -182,19 +183,19 @@ class TradeSampleDataFrame(DataframeResource):
             gc.collect()
             return sample_df
 
-        daily_dataframes = storage.fetch_tree(
+        daily_dataframes = fetch_tree(
             [
                 TradeSampleDataFrame(self.symbol, self.market, day_range)
                 for day_range in self.time_range.each(TimeDelta(days=1))
             ],
-            description=f"Making {self.path}"
+            description=f"Making {self.path}",
         )
 
         return pd.concat(daily_dataframes)
 
 
 def sample_trade_dataframe(
-    full_df: pd.DataFrame,
+    full_df: DataFrame,
     time_range: TimeRange,
 ):
 
@@ -273,8 +274,8 @@ cli = Typer(name="dataframe")
 @cli.command("ensure")
 def ensure(
     time_range: Annotated[TimeRange, Argument(parser=TimeRange.of)],
-    # symbol: Annotated[Symbol, Argument(parser=str)],
-    # market: Annotated[Market, Argument(parser=str)],
+    # symbolset: Annotated[Symbol, Argument(parser=str)],
+    # marketset: Annotated[Market, Argument(parser=str)],
     disposition: Annotated[Disposition, Option(parser=str)] = "sampled",
     local: Annotated[bool, Option()] = True,
     remote: Annotated[bool, Option()] = False,
@@ -282,30 +283,28 @@ def ensure(
 ):
     """Ensure the availability of the trade dataframes for the given symbol and market."""
 
-    tasks = list(
-        product(
-            DEFAULT_SYMBOLS,
-            DEFAULT_MARKETS,
-        )
-    )
+    symbols = DEFAULT_SYMBOLSET
+    markets = DEFAULT_MARKETSET
 
     match disposition:
-        case "sampled":
-            storage.ensure_tree(
+        case "full":
+            ensure_tree(
                 [
-                    TradeSampleDataFrame(symbol, market, time_range)
-                    for symbol, market in tasks
+                    TradeDataFrame(symbol, market, day)
+                    for market in markets
+                    for symbol in symbols
+                    for day in time_range.replace(step=TimeDelta(days=1))
                 ],
                 local=local,
                 remote=remote,
                 checking=checking,
             )
-        case "full":
-            storage.ensure_tree(
+        case "sampled":
+            ensure_tree(
                 [
-                    TradeDataFrame(symbol, market, day)
-                    for symbol, market in tasks
-                    for day in time_range.replace(step=TimeDelta(days=1))
+                    TradeSampleDataFrame(symbol, market, time_range)
+                    for market in markets
+                    for symbol in symbols
                 ],
                 local=local,
                 remote=remote,
@@ -315,5 +314,15 @@ def ensure(
             raise ValueError(f"Invalid disposition {disposition}")
 
 
+# %%
 if __name__ == "__main__":
-    cli()
+
+    ensure(TimeRange.of("2023-01-01_1m"), checking=True)
+
+    # TradeSampleDataFrame('BTCUSDT', 'binance-usdtm', TimeRange.of("2023-01-01 1m")).fetch()
+
+    # # %%
+    # with ZipFile(tdf.url.download()) as zipfile:
+    #     print(zipfile.namelist())
+    #     with zipfile.open(zipfile.namelist()[0]) as csv:
+    #         print(pd.read_csv(csv, nrows=10))

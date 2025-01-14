@@ -7,6 +7,8 @@ readme = "README.md"
 
 [tool.poetry.scripts]
 dataframe = "neuralab.trading.dataframe:cli"
+dataset = "neuralab.trading.dataset:cli"
+nl = "neuralab.__main__:cli"
 
 [tool.poetry.dependencies]
 python = "^3.12"

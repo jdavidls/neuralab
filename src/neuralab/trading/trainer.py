@@ -11,7 +11,7 @@ import optax
 from jax import numpy as jnp, random, tree
 from flax import nnx, struct
 
-from neuralab.trading.dataset import Dataset, Trends
+from neuralab.trading.dataset import Dataset
 from tqdm.notebook import trange, tqdm
 
 from neuralab import nl
@@ -34,6 +34,8 @@ class Labels(struct.PyTreeNode):
 
 
 class Trainer(nnx.Module):
+
+    
     @struct.dataclass
     class Settings(struct.PyTreeNode):
         low_duration: int = 10
@@ -45,7 +47,7 @@ class Trainer(nnx.Module):
         duration_score = jnp.array([1.0, 0.75, 0.5])
         returns_score = jnp.array([1.0, 0.75, 0.0])
 
-        def trend_initial_scores(self, trends: Trends):
+        def trend_initial_scores(self, trends: Dataset.Trends):
             duration_score = jnp.select(
                 [
                     trends.duration > self.high_duration,
@@ -72,14 +74,14 @@ class Trainer(nnx.Module):
 
             return duration_score * returns_score
 
-        def is_side_trend(self, trends: Trends):
+        def side_trend_indices(self, trends: Dataset.Trends):
             return (trends.returns < self.low_returns) | (
                 (trends.duration > self.high_duration)
                 & (trends.returns < self.high_returns)
             )
 
-        def categorical_trend_indices(self, trends: Trends):
-            side_trend_idx = self.is_side_trend(trends)
+        def categorical_trend_indices(self, trends: Dataset.Trends):
+            side_trend_idx = self.side_trend_indices(trends)
             up_trend_idx = (~side_trend_idx) & (trends.direction > 0)
             down_trend_idx = (~side_trend_idx) & (trends.direction < 0)
             return up_trend_idx, side_trend_idx, down_trend_idx
@@ -110,7 +112,7 @@ class Trainer(nnx.Module):
 
         mask = jnp.zeros(dataset.shape)
 
-        def categorical_label(trends: Trends, trend_scores: jnp.ndarray):
+        def categorical_label(trends: Dataset.Trends, trend_scores: jnp.ndarray):
             nonlocal mask
             mask = mask.at[trends.start_at, trends.batch, trends.market].add(
                 trend_scores

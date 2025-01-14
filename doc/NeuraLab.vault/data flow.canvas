@@ -1,0 +1,12 @@
+{
+	"nodes":[
+		{"id":"bdedc4098f8f822a","x":-720,"y":-500,"width":250,"height":60,"type":"text","text":"Trade Data Frame"},
+		{"id":"466916d600f8b2b2","type":"text","text":"Sample Data Frame","x":-720,"y":-380,"width":250,"height":60},
+		{"id":"92aff1f7cf1ece94","x":-720,"y":-260,"width":250,"height":60,"type":"text","text":"Dataset (Input Features)"},
+		{"id":"a414fb714ca8a33d","x":-420,"y":-260,"width":250,"height":60,"type":"text","text":"Logits"},
+		{"id":"6d255dd953813147","x":-100,"y":-140,"width":250,"height":60,"type":"text","text":"Ground Truth (Target)"},
+		{"id":"100f8156d131febc","x":-420,"y":-140,"width":250,"height":60,"type":"text","text":"Trends"},
+		{"id":"66c37d956655450f","x":-100,"y":-20,"width":250,"height":60,"type":"text","text":"Target Labels"}
+	],
+	"edges":[]
+}
