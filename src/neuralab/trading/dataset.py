@@ -25,11 +25,12 @@ from neuralab.trading.knowledge import (
     MarketSet,
     SymbolSet,
 )
+from neuralab.utils.base_dataset import BaseDataset, BatchIterable
 from neuralab.utils.timeutils import TimeRange
 
 
 @struct.dataclass
-class Dataset(Resource, struct.PyTreeNode):
+class Dataset(Resource, BaseDataset):
 
     @dataclass(frozen=True)
     class Ref[T: Dataset](Resource.Ref[T]):
@@ -188,8 +189,9 @@ class Dataset(Resource, struct.PyTreeNode):
             [getattr(self, feature) for feature in feature_names], axis=axis
         )
 
-    # def fix_for_batch(self, mode="tiny"):
-    #     return self.split_concat(32)[: 2**14].split_concat(8).with_trends
+    def batch_iter(self, batch_size: int) -> BatchIterable[Dataset]:
+        return BatchIterable(self, batch_size)
+
 
     @staticmethod
     def concat(datasets: list[Dataset], axis=1) -> Dataset:

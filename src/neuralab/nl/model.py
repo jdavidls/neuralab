@@ -296,7 +296,6 @@ class Fit[M: Model]:
             raise RuntimeError("Training is already running.")
         self.thread = Thread(target=self, args=args, kwargs=kwargs)
         self.thread.start()
-        return self.thread
 
     def stop(self):
         """

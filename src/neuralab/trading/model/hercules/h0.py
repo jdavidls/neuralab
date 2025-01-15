@@ -1,4 +1,5 @@
 # %%
+import pickle
 import jax
 import numpy as np
 from chex import dataclass
@@ -9,6 +10,7 @@ import optax
 
 from neuralab import fn, nl
 from neuralab.trading.dataset import Dataset
+
 from neuralab.trading.ground_truth import GroundTruth
 from neuralab.trading.model.base_model import TradingModel
 from neuralab.trading.trainer import Labels
@@ -44,13 +46,13 @@ class H0(TradingModel):
                 + self.num_in_timeseries * self.num_ema_layers  # batch normalized vars
                 + fn.diff_matrix_num_outputs(
                     self.num_ema_layers
-                )  # price confussion matrix
+                )  # price diff matrix
                 + fn.diff_matrix_num_outputs(
                     self.num_ema_layers
-                )  # volume confussion matrix
+                )  # volume diff matrix
                 + fn.diff_matrix_num_outputs(
                     2 * self.num_ema_layers
-                )  # imbalance confussion matrix
+                )  # imbalance diff matrix
             )
 
         num_ema_layers: int = 4
@@ -121,6 +123,7 @@ class H0(TradingModel):
             )
 
         self.feed = nnx.Cache(None)
+        self.feat = nnx.Cache(None)
 
     def __call__(self, dataset: Dataset):
         x = dataset.timeseries(
@@ -168,15 +171,54 @@ if __name__ == "__main__":
             )
         )
     )
+    model.training
+
+    with open('model.pkl', 'rb') as f:
+        state = pickle.load(f)
+
+    graph, _ = nnx.split(model)
+    model = nnx.merge(graph, state)
+    #%%
+    
+
     trainer = nl.fit(model)
 
     dataset = Dataset.Ref.of("2021 1m").fetch()
     # with jax.checking_leaks():
+    #%%
     trainer.start(dataset, num_epochs=1000)
 
     #%% evaluation
+    evaluation_set = Dataset.Ref.of("2024 1m").fetch()
 
+    #%%
+
+
+    #%%
+    from neuralab.trading.evaluation import evaluate
+  
+    @nnx.jit()
+    def eval_perf(model, dataset):
+        logits = model(dataset)
+        return evaluate(logits[..., 1, :], dataset).total_performance
     
+    perf = jnp.array([eval_perf(model, batch) for batch in evaluation_set.batch_iter(2048)])
+    
+    #%%
+    
+        
+
+    ev_set = evaluation_set[20000:22048]
+    logits = model(ev_set)[..., 1, :]
+    eval = evaluate(logits, ev_set)
+
+    price = ev_set.log_price[:, 0, 0]
+
+    plt.plot((price - jnp.min(price)) / (jnp.max(price) - jnp.min(price)), color='green')
+    plt.pcolormesh(rearrange(nnx.softmax(logits[:, 0,0]), "t p -> 1 t p"))
+    plt.colorbar()
+    plt.show()
+
 
     # %% Surgery
 
