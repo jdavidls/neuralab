@@ -8,6 +8,7 @@ from typing import Literal
 from einops import rearrange
 from jax import numpy as jnp, tree
 from jaxtyping import Array, Float
+from matplotlib.pylab import f
 from optax import losses
 
 from neuralab import nl
@@ -18,25 +19,38 @@ from neuralab.trading.ground_truth import GroundTruth
 
 class TradingModel(nl.Model):
 
-    @dataclass(frozen=True)
+    @dataclass()
     class Settings(nl.Model.Settings):
         training: TradingModel.Training.Settings = field(
             default_factory=lambda: TradingModel.Training.Settings()
         )
 
     class Training(nl.Model.Training):
+        model: TradingModel
 
-        @dataclass(frozen=True)
+        @dataclass()
         class Settings(nl.Model.Training.Settings):
             ground_truth: GroundTruth.Settings = field(
                 default_factory=lambda: GroundTruth.Settings()
             )
-            # batch_size = 4096
-            loss_fn: Literal["mse", "cross_entropy", "max_total_perf"] = "cross_entropy"
+
+            type LossFn = Literal["mse", "cross_entropy", "max_total_perf"]
+
+            @property
+            def num_heads(self):
+                return len(self.head_losses)
+
+            head_losses: dict[str, LossFn] = field(
+                default_factory=lambda: {
+                    "ce": "cross_entropy",
+                    "ev": "max_total_perf",
+                }
+            )
 
         type Batch = tuple[Dataset, GroundTruth.Labels]
 
         class Session(nl.Model.Training.Session):
+            training: TradingModel.Training
 
             def prepare_dataset(self, dataset: Dataset, batch_size: int = 2048):
                 self.dataset = dataset
@@ -84,24 +98,36 @@ class TradingModel(nl.Model):
 
         def loss(self, batch: Batch):
             x, y = batch
-            logits = self.model(x)
+            head_logits = self.model(x)
+            t, a, m, *head_shape = head_logits.shape
 
-            match self.settings.loss_fn:
-                case "mse":
-                    loss = jnp.mean((logits - y.one_hot) ** 2, axis=-1) * y.mask
+            assert (
+                head_shape[0] == self.settings.num_heads
+            ), f"Expected {self.settings.num_heads} heads, got {head_shape[0]}"
 
-                case "cross_entropy":
-                    loss = jnp.mean(
-                        losses.softmax_cross_entropy(logits, y.one_hot) * y.mask
-                    )
+            def head_loss_fn(fn, logits):
+                match fn:
+                    case "mse":
+                        return jnp.mean((logits - y.one_hot) ** 2, axis=-1) * y.mask
+                    case "cross_entropy":
+                        return jnp.mean(
+                            losses.softmax_cross_entropy(logits, y.one_hot) * y.mask
+                        )
+                    case "max_total_perf":
+                        return evaluate(logits, x).loss()
+                    case _:
+                        raise ValueError(f"Unknown loss function {fn}")
 
-                case "max_total_perf":
-                    loss = evaluate(logits, x).loss()
+            loss_vals = [
+                head_loss_fn(fn, head_logits[..., i, :])
+                for i, fn in enumerate(self.settings.head_losses.values())
+            ]
 
-            return loss
+            for key, loss in zip(self.settings.head_losses, loss_vals):
+                setattr(self, f"{key}_loss", nl.Loss(loss))
 
         def __init__(self, model: TradingModel):
             super().__init__(model)
 
-    @abstractmethod
-    def __call__(self, x: Dataset) -> Float[Array, "logits"]: ...
+    def __call__(self, x: Dataset) -> Float[Array, "logits"]:
+        raise NotImplementedError

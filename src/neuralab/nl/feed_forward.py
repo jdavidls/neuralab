@@ -1,6 +1,10 @@
 from typing import Callable, Optional
 from flax import nnx
 from jaxtyping import Array, Float
+from jax import numpy as jnp
+from numpy import pi as PI
+
+from neuralab import fn
 
 class FeedForward(nnx.Module):
     def __init__(
@@ -50,3 +54,13 @@ class FeedForward(nnx.Module):
             x = self.norm(x)
         return x
 
+class TriactForward(nnx.Module):
+    def __init__(self, input_features: int, output_features: int, rngs: nnx.Rngs):
+        self.input_features = input_features
+        self.output_features = output_features
+
+        self.scaler = nnx.Param(jnp.ones(input_features) * PI)
+        self.proj = nnx.Linear(3 * input_features, output_features, rngs=rngs)
+
+    def __call__(self, x):
+        return self.proj(fn.triact(x * self.scaler))

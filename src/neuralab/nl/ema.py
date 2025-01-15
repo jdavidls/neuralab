@@ -222,7 +222,7 @@ class EMStats(nnx.Module):
 
         return ema, emv
 
-    def norm(self, x, eps=1e-6):
+    def norm(self, x, eps=1e-4):
         """Standardizes the input using EMA and ESD.
 
         Args:
@@ -242,7 +242,7 @@ class EMStats(nnx.Module):
         preventing division by zero when ESD is close to zero.
         """
         ema, emv = self.emav(x)
-        nrm = (x[..., None] - ema) * lax.rsqrt(emv)
+        nrm = (x[..., None] - ema) * lax.rsqrt(emv + eps)
         return ema, emv, nrm
 
 

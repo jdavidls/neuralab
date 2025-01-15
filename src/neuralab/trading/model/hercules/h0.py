@@ -5,23 +5,24 @@ from chex import dataclass
 from einops import rearrange
 from flax import nnx, struct
 from jax import numpy as jnp
+import optax
 
-from neuralab import nl
+from neuralab import fn, nl
 from neuralab.trading.dataset import Dataset
+from neuralab.trading.ground_truth import GroundTruth
 from neuralab.trading.model.base_model import TradingModel
 from neuralab.trading.trainer import Labels
 
 
 class H0(TradingModel):
 
-
-    @dataclass(frozen=True)
+    @dataclass()
     class Settings(TradingModel.Settings):
 
         in_timeseries: list[Dataset.Feature] = struct.field(
             default_factory=lambda: [
                 "log_price",
-                "log_volume",  # NOTE: dado que volume es la suma de bid y ask,
+                # "log_volume",  # NOTE: dado que volume es la suma de bid y ask,
                 # esta caracteristica podria descartarse en favor
                 # de 'price', que es necesario para el computo
                 # en algunos mercados
@@ -38,13 +39,18 @@ class H0(TradingModel):
 
         @property
         def num_feed_features(self):
-            sum_range = lambda L: (L**2 - L) // 2  # sum(range(L))
             return (
-                self.num_in_timeseries * self.num_ema_layers  # normalized features
+                +self.num_in_timeseries * self.num_ema_layers  # normalized features
                 + self.num_in_timeseries * self.num_ema_layers  # batch normalized vars
-                + sum_range(self.num_ema_layers)  # price confussion matrix
-                + sum_range(self.num_ema_layers)  # volume confussion matrix
-                + sum_range(2 * self.num_ema_layers)  # imbalance confussion matrix
+                + fn.diff_matrix_num_outputs(
+                    self.num_ema_layers
+                )  # price confussion matrix
+                + fn.diff_matrix_num_outputs(
+                    self.num_ema_layers
+                )  # volume confussion matrix
+                + fn.diff_matrix_num_outputs(
+                    2 * self.num_ema_layers
+                )  # imbalance confussion matrix
             )
 
         num_ema_layers: int = 4
@@ -54,6 +60,7 @@ class H0(TradingModel):
         # num_hmm_states: int = 8
         num_features = 64
         num_out_logits = 3
+
 
     def __init__(
         self,
@@ -70,20 +77,26 @@ class H0(TradingModel):
 
         self.feed_norm = nnx.BatchNorm(settings.num_feed_features, rngs=rngs)
 
-        self.feed_proj = nnx.Linear(
-            in_features=settings.num_feed_features,
-            out_features=settings.num_features,
-            rngs=rngs,
-        )
 
-        self.feat = nl.FeedForward(
-            settings.num_feed_features,
-            2.0,
-            settings.num_features,
-            residual=False,
-            normalization=False,
-            rngs=rngs,
-        )
+        if False:
+            self.feat_proj = nl.FeedForward(
+                settings.num_feed_features,
+                settings.num_features * 2,
+                settings.num_features,
+                residual=False,
+                rngs=rngs,
+            )
+        else:
+            self.feat_proj = nnx.Linear(
+                settings.num_feed_features,
+                settings.num_features,
+                rngs=rngs,
+            )
+
+
+        # self.feat_proj = nl.TriactForward(
+        #     settings.num_feed_features, settings.num_features, rngs=rngs
+        # )
 
         self.layers = nnx.Sequential(
             # nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
@@ -91,14 +104,23 @@ class H0(TradingModel):
             # nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
         )
 
-        self.logits = nl.FeedForward(
-            settings.num_features,
-            2.0,
-            settings.num_out_logits,
-            residual=False,
-            normalization=False,
-            rngs=rngs,
-        )
+        if False:
+            self.logits_proj = nl.FeedForward(
+                settings.num_features,
+                2.,
+                len(settings.training.head_losses) * 3,
+                residual=False,
+                normalization=False,
+                rngs=rngs,
+            )
+        else:
+            self.logits_proj = nnx.Linear(
+                settings.num_features,
+                len(settings.training.head_losses) * 3,
+                rngs=rngs,
+            )
+
+        self.feed = nnx.Cache(None)
 
     def __call__(self, dataset: Dataset):
         x = dataset.timeseries(
@@ -108,80 +130,92 @@ class H0(TradingModel):
         # Feed
         avg, var, nrm = self.ema.norm(x)  # EM avg var norm
 
-        def diff_matrix(
-            x,
-        ):  # fn.diff_matrix and fn.diff_matrix_output(in) -> out { (in * in - in) / 2 }
-            a = x[..., None, :]
-            b = x[..., :, None]
-            i, j = jnp.triu_indices(x.shape[-1], 1)
-            return (a - b)[..., i, j]
-
         feed = jnp.concatenate(
             [
                 rearrange(nrm, "t b m f l -> t b m (f l)"),
                 rearrange(var, "t b m f l -> t b m (f l)"),
-                diff_matrix(avg[..., 0, :]),
-                diff_matrix(avg[..., 1, :]),
-                diff_matrix(jnp.concatenate([avg[..., 2, :], avg[..., 3, :]], axis=-1)),
+                fn.diff_matrix(avg[..., 0, :]),
+                fn.diff_matrix(avg[..., 1, :]),
+                fn.diff_matrix(
+                    jnp.concatenate([avg[..., 2, :], avg[..., 3, :]], axis=-1)
+                ),
             ],
             axis=-1,
         )
 
         feed = self.feed_norm(feed)
+        self.feed = nnx.Cache(feed)
 
         # Feat
-        feat = self.feed_proj(feed)
+        feat = self.feat_proj(feed)
         feat = self.layers(feat)
+        self.feat = nnx.Cache(feat)
 
         # Logits
-        logits = self.logits(feat)
+        logits = self.logits_proj(feat)
 
-        return logits
+        return rearrange(logits, "t b m (h f) -> t b m h f", h=self.settings.training.num_heads)
 
 
 if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
     # jax.config.update("jax_debug_nans", True)
-    model = H0()  # .load_state("training")
+    model = H0(
+        settings=H0.Settings(
+            training=H0.Training.Settings(
+                optimizer=optax.adam(1e-3),
+            )
+        )
+    )
     trainer = nl.fit(model)
 
     dataset = Dataset.Ref.of("2021 1m").fetch()
-    #with jax.checking_leaks():
-    trainer.start(dataset, num_epochs=10000)
+    # with jax.checking_leaks():
+    trainer.start(dataset, num_epochs=1000)
 
+    #%% evaluation
+
+    
+
+    # %% Surgery
+
+    # show feed
+    plt.pcolormesh(rearrange(model.feed.value[:100], "t a m f -> t (a m f)"))
+    plt.colorbar()
+    plt.show()
 
     # %%
-    loss, metrics, x, y = trainer(
-        dataset,
-        epochs=1000,
-        display_every=100,
-        batch_size=2,
-        # batch_slice=slice(0, 8),
+    from neuralab.trading.ground_truth import GroundTruth
+
+    ground_truth = GroundTruth.from_dataset(
+        dataset, model.settings.training.ground_truth
     )
+    sli = slice(0, 1000)
+    labels = ground_truth.labels[sli]
+    logits = model(dataset[sli])
 
-    # %%
+    # plt.pcolormesh(rearrange(diffusion[..., 0:1, :], "t b m f -> t (b m f)"))
+    # plt.colorbar()
+    # plt.show()
 
-    i = 5
-    logits, diffusion, feat = model(x[:, i : i + 1])
-    cats = y[:, i : i + 1].cats
-    mask = y[:, i : i + 1].mask
+    # plt.pcolormesh(rearrange(feat, "t b m f -> t (b m f)"))
+    # plt.colorbar()
+    # plt.show()
 
-    plt.pcolormesh(rearrange(diffusion[..., 0:1, :], "t b m f -> t (b m f)"))
+    plt.pcolormesh(
+        rearrange(labels.one_hot * labels.mask[..., None], "t a m p -> t (a m p)")
+    )
     plt.colorbar()
     plt.show()
 
-    plt.pcolormesh(rearrange(feat, "t b m f -> t (b m f)"))
+    plt.pcolormesh(rearrange(nnx.softmax(logits), "t a m h p -> t (h a m p)"))
     plt.colorbar()
     plt.show()
 
-    plt.pcolormesh(rearrange(nnx.softmax(logits), "t b m a -> t (b m a)"))
-    plt.colorbar()
-    plt.show()
-
-    plt.pcolormesh(rearrange(cats * mask[..., None], "t b m a -> t (b m a)"))
-    plt.colorbar()
-    plt.show()
+    # plt.pcolormesh(rearrange(cats * mask[..., None], "t b m a -> t (b m a)"))
+    # plt.colorbar()
+    # plt.show()
     # %%
 
     probs = nnx.softmax(logits)  # log_softmax??

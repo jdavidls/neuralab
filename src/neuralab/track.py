@@ -4,12 +4,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from functools import wraps
 from threading import Lock
-from typing import IO, Any, BinaryIO, Callable, Literal, Optional, cast
+from typing import IO, Any, BinaryIO, Callable, Literal, Optional
 
 from rich import console, progress, style, table, text
-from rich.progress import BarColumn, Progress, ProgressColumn, Task
+from rich.progress import (BarColumn, Progress, ProgressColumn, Task,
+                           TimeElapsedColumn, TimeRemainingColumn)
 from rich.text import Text as RichText
-from sympy import fu
 
 from neuralab import logging, settings
 
@@ -68,6 +68,8 @@ PROGRESS_ARGS = [
     BarColumn(
         table_column=table.Column(ratio=1),
     ),
+    TimeElapsedColumn(),
+    TimeRemainingColumn(),
 ]
 PROGRESS_KWARGS = dict(
     transient=True,
@@ -76,7 +78,7 @@ PROGRESS_KWARGS = dict(
 
 
 @contextmanager
-def _adquire_progress_context(): # future live context..
+def _adquire_progress_context():  # future live context..
     global PROGRESS
     with PROGRESS_LOCK:
         if PROGRESS is None:
@@ -259,10 +261,10 @@ def parallel_map[
                     if exc := result.exception():
                         raise exc
 
-                    pos, res = result.result()                    
+                    pos, res = result.result()
                     results[pos] = res
                     trackbar.update(advance=1)
-                    
+
             except:
                 executor.shutdown(wait=wait_on_exc, cancel_futures=True)
                 raise

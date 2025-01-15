@@ -13,7 +13,7 @@ from threading import Lock, Thread
 from typing import ClassVar, Generator, Optional
 
 import optax
-from flax import nnx, struct
+from flax import nnx, struct, typing as flax_typing
 from jax import numpy as jnp
 from jax import tree
 from jaxtyping import Array, Float
@@ -30,7 +30,6 @@ class StopTraining(BaseException): ...
 class LossNonFiniteException(ValueError): ...
 
 
-
 class Model(nnx.Module):
     """
     Un modelo es un modulo entrenable: define un trainer.
@@ -38,13 +37,11 @@ class Model(nnx.Module):
 
     @dataclass(frozen=True)
     class Ref(Resource.Ref):
-        preset: str = "default"
+        ...#nnx.split
 
-    @dataclass(frozen=True)
+    @dataclass()
     class Settings(ABC):
         training: Model.Training.Settings
-
-    presets: ClassVar[dict[str, Settings]] = {}
 
     class Training(nnx.Module):  # a abstract class of trainer
         """
@@ -53,10 +50,9 @@ class Model(nnx.Module):
         trainer accede a model pero no tiene model dentro de el...
         """
 
-        @dataclass(frozen=True)
+        @dataclass()
         class Settings(ABC):
-            def create_optimizer(self) -> optax.GradientTransformation:
-                return optax.adam(1e-3)
+            optimizer: optax.GradientTransformation = optax.adam(1e-3)
 
         class Session:
             def __init__(self, training: Model.Training):
@@ -125,9 +121,10 @@ class Model(nnx.Module):
         def __init__(self, model: Model):
             self.settings = model.settings.training
             self.model = model
-            self.optimizer = nnx.Optimizer(self, self.settings.create_optimizer())
+            self.optimizer = nnx.Optimizer(self, self.settings.optimizer)
 
         session: Session
+        main_loss: Loss
 
         @contextmanager
         def enter_session(self):
@@ -141,15 +138,19 @@ class Model(nnx.Module):
             """
             Train step function.
             """
-            main_loss = self.loss(batch)
+            self.loss(batch)
 
-            metrics = nnx.pop(self.model, Metric).flat_state()
+            metrics = nnx.pop(self, Metric).flat_state()
 
-            collected_losses = sum(
-                loss.value for loss in metrics.values() if issubclass(loss.type, Loss)
+            loss = sum(
+                jnp.mean(loss.value)
+                for loss in metrics.values()
+                if issubclass(loss.type, Loss)
             )
 
-            return main_loss + collected_losses, metrics
+            metrics = {_metric_path_to_str(k): v.value for k, v in metrics.items()}
+
+            return loss, metrics
 
         @abstractmethod
         def loss(self, batch) -> Float[Array, "..."]: ...
@@ -161,6 +162,10 @@ class Model(nnx.Module):
     def __init__(self, ref: Ref, settings: Settings):
         self.ref = ref
         self.settings = settings
+
+
+def _metric_path_to_str(path: flax_typing.PathParts):
+    return ".".join(str(part) for part in path)
 
 
 ## puede almacenarse la estructura fit entera para suspender un entrenamiento
@@ -195,8 +200,14 @@ class Fit[M: Model]:
         def __call__(self, *args, **kwargs):
             return self.run_session(*args, **kwargs)
 
-        def run_session(self, *args, num_epochs: int, **kwargs):
+        def _append_history(self, metrics):
+            if self.history is not None:
+                for k, v in metrics.items():
+                    self.history[k] = jnp.append(self.history[k], v)
+            else:
+                self.history = metrics
 
+        def run_session(self, *args, num_epochs: int, **kwargs):
             try:
 
                 with (
@@ -209,25 +220,17 @@ class Fit[M: Model]:
                 ):
 
                     trackbar.update(
-                        description=(f"[EPOCH {0}/{num_epochs}]"),
+                        description=(f"[EPOCH {1}/{num_epochs}] Running..."),
                     )
 
                     for epoch in range(num_epochs):
-                        loss, train_metrics = self.run_epoch(session)
+                        train_metrics = self.run_epoch(session)
 
-                        if self.history is not None:
-                            self.history["loss"] = jnp.append(
-                                self.history["loss"], loss
-                            )
-                            for k, v in train_metrics.items():
-                                k = ".".join(k)
-                                self.history[k] = jnp.append(self.history[k], v)
-                        else:
-                            self.history = {"loss": loss, **train_metrics}
+                        self._append_history(train_metrics)
 
                         trackbar.update(
                             description=(
-                                f"[EPOCH {epoch}/{num_epochs}] " f"Loss: {loss[0]:.4f}"
+                                f"[EPOCH {epoch+1}/{num_epochs}] {_dump_metrics(train_metrics)}"
                             ),
                             advance=1,
                         )
@@ -246,25 +249,6 @@ class Fit[M: Model]:
             #         return self.train_step(xx, yy)
             #     return batch_scanner(x, y)
 
-            @nnx.jit
-            def run_batch(
-                training, batch
-            ) -> tuple[jnp.ndarray, dict[tuple[str], jnp.ndarray]]:
-
-                # batch = training.session.prepare_batch(batch)
-
-                def loss_fn(model_training):
-                    loss, metrics = model_training(batch)
-                    safe_loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
-                    return safe_loss, (loss, metrics)  # states??
-
-                grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-                (_, (loss, metrics)), grad = grad_fn(self.training)
-
-                training.optimizer.update(grad)
-
-                return loss, metrics
-
             with (
                 session.enter_epoch() as epoch,
                 track.task(
@@ -274,28 +258,27 @@ class Fit[M: Model]:
             ):
 
                 trackbar.update(
-                    description=(f"[BATCH {0}/{len(epoch)}] "),
+                    description=(f"[BATCH {1}/{len(epoch)}] Running..."),
                 )
 
-                epoch_losses, epoch_metrics = [], []
+                epoch_metrics = []
 
                 for n, batch in enumerate(epoch):
-                    loss, metrics = _run_batch(self.training, batch)
+                    metrics = _run_batch(self.training, batch)
 
                     trackbar.update(
-                        description=(f"[BATCH {n}/{len(epoch)}] " f"loss: {loss:.4f} "),
+                        description=(
+                            f"[BATCH {n+1}/{len(epoch)}] {_dump_metrics(metrics)}"
+                        ),
                         advance=1,
                     )
 
-                    if not jnp.isfinite(loss):
-                        raise LossNonFiniteException(f"Loss is {loss}")
+                    if not jnp.isfinite(metrics["loss"]):
+                        raise LossNonFiniteException(f"Loss is {metrics["loss"]}")
 
-                    epoch_losses.append(loss)
                     epoch_metrics.append(metrics)
 
-                return _reduce_epoch_metrics(epoch_losses), tree.map(
-                    _reduce_epoch_metrics, *epoch_metrics
-                )
+                return tree.map(_reduce_epoch_metrics, *epoch_metrics)
 
         def run_evaluation(self, session):
             pass
@@ -330,29 +313,9 @@ class Fit[M: Model]:
         return self.trainer.history
 
 
-@nnx.jit
-def _run_batch(
-    training: Model.Training,
-    batch,
-) -> tuple[jnp.ndarray, dict[tuple[str], jnp.ndarray]]:
-
-    # batch = training.session.prepare_batch(batch)
-
-    def loss_fn(model_training):
-        loss, metrics = model_training(batch)
-        safe_loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
-        return safe_loss, (loss, metrics)  # states??
-
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (_, (loss, metrics)), grad = grad_fn(training)
-
-    training.optimizer.update(grad)
-
-    return loss, metrics
-
-
-def _reduce_epoch_metrics(values: list[jnp.ndarray]) -> jnp.ndarray:
-    return jnp.mean(jnp.array(values))[None]
+def _dump_metrics(metrics: dict[str, jnp.ndarray]):
+    metrics = tree.map(jnp.mean, metrics)
+    return " ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
 
 
 def fit[M: Model](model: M) -> Fit[M]:
@@ -360,6 +323,32 @@ def fit[M: Model](model: M) -> Fit[M]:
     Transforma el modelo es un objeto entrenable
     """
     return Fit(model)
+
+
+@nnx.jit
+def _run_batch(
+    training: Model.Training,
+    batch,
+) -> dict[str, jnp.ndarray]:
+
+    # batch = training.session.prepare_batch(batch)
+
+    def loss_fn(training):
+        loss, metrics = training(batch)
+        metrics["loss"] = loss
+        loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
+        return loss, metrics
+
+    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+    (_, metrics), grad = grad_fn(training)
+
+    training.optimizer.update(grad)
+
+    return metrics
+
+
+def _reduce_epoch_metrics(*values: list[jnp.ndarray]) -> jnp.ndarray:
+    return jnp.mean(jnp.array(values))[None]
 
 
 # %%

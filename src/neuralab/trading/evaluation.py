@@ -115,8 +115,8 @@ def evaluate(
         case (3,):
             probs = nnx.softmax(logits)
 
-            probs_out = probs[:, :, :, 1]
             probs_long = probs[:, :, :, 0]
+            probs_out = probs[:, :, :, 1]
             probs_short = probs[:, :, :, 2]
 
             turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp.abs(
@@ -130,8 +130,8 @@ def evaluate(
 
             probs = nnx.softmax(logits)
 
-            probs_out = probs[:, :, :, 1]
             probs_long = probs[:, :, :, 0] * leverage
+            probs_out = probs[:, :, :, 1]
             probs_short = probs[:, :, :, 2] * leverage
 
             turnover = jnp.abs(jnp.diff(probs_long, axis=0)) + jnp.abs(
