@@ -18,7 +18,7 @@ from pandas import DataFrame, read_parquet
 from neuralab import track
 from neuralab.resource import Resource, Url, ensure_tree, fetch_tree
 from neuralab.trading.knowledge import DEFAULT_MARKETSET, DEFAULT_SYMBOLSET, Market, Symbol
-from neuralab.utils.timeutils import Date, TimeDelta, TimeRange, milliseconds
+from time_range import Date, TimeDelta, TimeRange, milliseconds
 
 log = get_logger(__name__)
 

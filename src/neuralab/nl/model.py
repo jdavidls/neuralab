@@ -10,18 +10,27 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from threading import Lock, Thread
-from typing import ClassVar, Generator, Optional
+from typing import (
+    Iterator,
+    Optional,
+    Protocol,
+    Self,
+    overload,
+)
 
+from attrs import field
 import optax
 from flax import nnx, struct, typing as flax_typing
 from jax import numpy as jnp
 from jax import tree
 from jaxtyping import Array, Float
-from zmq import has
 
 from neuralab import track
-from neuralab.nl.common import Loss, Metric
-from neuralab.resource import Resource
+from neuralab.nl.common import Loss, Metric, reset_state
+
+from itertools import pairwise
+from typing import Generator, Sequence, overload
+from flax import struct
 
 
 class StopTraining(BaseException): ...
@@ -30,147 +39,116 @@ class StopTraining(BaseException): ...
 class LossNonFiniteException(ValueError): ...
 
 
+class BaseDataset(struct.PyTreeNode):
+
+    @property
+    def shape(self) -> list[int]:
+        leaves = tree.leaves(self)
+
+        if len(leaves) == 0:
+            return []
+
+        assert all(a.shape == b.shape for a, b in zip(leaves[:-1], leaves[1:]))
+
+        return leaves[0].shape
+
+    def __len__(self) -> int:
+        return self.shape[0] if len(self.shape) > 0 else 0
+
+    def __getitem__(self, *args) -> Self:
+        return tree.map(lambda v: v.__getitem__(*args), self)
+
+    def batched(self, batch_size: int) -> BatchedDataset[Self]:
+        return BatchedDataset(self, batch_size)
+
+
+class DatasetLike(Protocol):
+
+    @property
+    def shape(self) -> list[int]: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, *args) -> Self: ...
+
+
+class BatchedDataset[T: DatasetLike]:
+    __slots__ = ("dataset", "batch_size")
+
+    def __init__(self, dataset: T, batch_size: int):
+        self.batch_size = batch_size
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    @overload
+    def __getitem__(self, index: slice) -> Self: ...
+
+    @overload
+    def __getitem__(self, index: int) -> T: ...
+
+    def __getitem__(self, index):  # -> T | Self:
+
+        if isinstance(index, slice):
+            return BatchedDataset(
+                self.dataset[
+                    index.start * self.batch_size : index.stop * self.batch_size
+                ],
+                self.batch_size * index.step,
+            )
+
+        if index < 0:
+            index += len(self)
+
+        return self.dataset[index * self.batch_size : (index + 1) * self.batch_size]
+
+    def __iter__(self) -> Iterator[T]:
+        for n, m in pairwise(range(0, len(self.dataset) + 1, self.batch_size)):
+            yield self.dataset[n:m]
+
+
 class Model(nnx.Module):
     """
     Un modelo es un modulo entrenable: define un trainer.
     """
 
-    @dataclass(frozen=True)
-    class Ref(Resource.Ref):
-        ...#nnx.split
-
-    @dataclass()
-    class Settings(ABC):
-        training: Model.Training.Settings
-
-    class Training(nnx.Module):  # a abstract class of trainer
-        """
-        El trainer puede generar datos agregados al dataset (hippo features)
-        tambien puede re-asignar parametros de forma dinamica
-        trainer accede a model pero no tiene model dentro de el...
-        """
+    class Trainer[TrainBatch: DatasetLike, EvalBatch: DatasetLike](nnx.Module):
 
         @dataclass()
-        class Settings(ABC):
+        class Settings:
             optimizer: optax.GradientTransformation = optax.adam(1e-3)
 
-        class Session:
-            def __init__(self, training: Model.Training):
-                """
-                Initialize the session with the training object.
-                """
-                self.training = training
+        settings: Settings
 
-            @abstractmethod
-            def prepare_dataset(self, *args, **kwargs):
-                """
-                Prepare the session with the given arguments.
-                """
-                raise NotImplementedError
-
-            @abstractmethod
-            def __len__(self) -> int:
-                """
-                Return the length of the session.
-                """
-                pass
-
-            @abstractmethod
-            def __iter__(self):
-                """
-                Iterate over the session.
-                """
-                yield ...
-
-            def dispose_dataset(self):
-                """
-                Dispose of the session resources.
-                """
-                pass
-
-            @contextmanager
-            def enter_dataset(self, *args, **kwargs):
-                """
-                Context manager to enter a dataset.
-                """
-                try:
-                    self.prepare_dataset(*args, **kwargs)
-                    yield self
-                finally:
-                    self.dispose_dataset()
-
-            @contextmanager
-            def enter_epoch(self):
-                """
-                Context manager for an epoch.
-                """
-                yield self
-
-            def prepare_batch(self, batch):
-                """
-                Prepare a batch for training.
-                """
-                return batch
-
-            def update_params(self, grad):
-                """
-                Update the parameters using the optimizer.
-                """
-                self.training.optimizer.update(grad)
-
-        def __init__(self, model: Model):
-            self.settings = model.settings.training
+        def __init__(self, model: Model, settings: Settings):
             self.model = model
+            self.settings = settings
             self.optimizer = nnx.Optimizer(self, self.settings.optimizer)
 
-        session: Session
-        main_loss: Loss
-
         @contextmanager
-        def enter_session(self):
-            try:
-                self.session = self.Session(self)
-                yield self.session
-            finally:
-                del self.session
-
-        def __call__(self, batch):
-            """
-            Train step function.
-            """
-            self.loss(batch)
-
-            metrics = nnx.pop(self, Metric).flat_state()
-
-            loss = sum(
-                jnp.mean(loss.value)
-                for loss in metrics.values()
-                if issubclass(loss.type, Loss)
-            )
-
-            metrics = {_metric_path_to_str(k): v.value for k, v in metrics.items()}
-
-            return loss, metrics
+        def session(self, *args, **kwargs):
+            yield self.prepare_session(*args, **kwargs)
 
         @abstractmethod
-        def loss(self, batch) -> Float[Array, "..."]: ...
+        def prepare_session(self, *args, **kwargs) -> tuple[BatchedDataset[TrainBatch], BatchedDataset[EvalBatch]]: ...
 
-    @cached_property
-    def training(self):
-        return self.Training(self)  # type: ignore
+        @abstractmethod
+        def train_fn(self, batch: TrainBatch): ...
 
-    def __init__(self, ref: Ref, settings: Settings):
-        self.ref = ref
+        @abstractmethod
+        def eval_fn(self, batch: EvalBatch): ...
+
+    @dataclass()
+    class Settings:
+        trainer: Model.Trainer.Settings
+
+    def __init__(self, settings: Settings):
         self.settings = settings
 
-
-def _metric_path_to_str(path: flax_typing.PathParts):
-    return ".".join(str(part) for part in path)
 
 
 ## puede almacenarse la estructura fit entera para suspender un entrenamiento
 ## fit geenra un identificador unico y almacena los datos de entrenamiento.
-class Fit[M: Model]:
+class Training[T: Model.Trainer]:
     """
     Fit se encarga de gestionar el proceso de entrenamiento de un modelo
 
@@ -179,175 +157,208 @@ class Fit[M: Model]:
     model_fit(dataset) entrena el modelo (en un hilo separado)
     """
 
-    def __init__(self, model: M):
-        self.trainer = self.Trainer(model)
+    def __init__(self, trainer: T):
+        self.trainer = trainer  # type: ignore
+        self.train_history: Optional[dict[str, Float[Array, "losses and metrics"]]] = (
+            None
+        )
+        self.eval_history: Optional[dict[str, Float[Array, "losses and metrics"]]] = (
+            None
+        )
+        self.thread = None
 
-    class Trainer:
-        def __init__(
-            self,
-            model: Model,
-            *,
-            evaluate_every=10,
-            try_batch_scan=False,
-        ):
-            self.training = model.training
-            self.evaluate_every = evaluate_every
-            self.try_batch_scan = try_batch_scan
-            self.history: Optional[dict[str, Float[Array, "losses and metrics"]]] = None
+    def __call__(self, *args, **kwargs):
+        """
+        Start the training process.
+        """
+        if self.thread is not None:
+            raise RuntimeError("Training is already running.")
+        self.thread = Thread(target=self.run_session, args=args, kwargs=kwargs)
+        self.thread.start()
 
-        current_session: Optional[Model.Training.Session] = None
-
-        def __call__(self, *args, **kwargs):
-            return self.run_session(*args, **kwargs)
-
-        def _append_history(self, metrics):
-            if self.history is not None:
-                for k, v in metrics.items():
-                    self.history[k] = jnp.append(self.history[k], v)
-            else:
-                self.history = metrics
-
-        def run_session(self, *args, num_epochs: int, **kwargs):
-            try:
-
-                with (
-                    track.task(
-                        total=num_epochs,
-                        description="[EPOCH] Preparing...",
-                    ) as trackbar,
-                    self.training.enter_session() as session,
-                    session.enter_dataset(*args, **kwargs),
-                ):
-
-                    trackbar.update(
-                        description=(f"[EPOCH {1}/{num_epochs}] Running..."),
-                    )
-
-                    for epoch in range(num_epochs):
-                        train_metrics = self.run_epoch(session)
-
-                        self._append_history(train_metrics)
-
-                        trackbar.update(
-                            description=(
-                                f"[EPOCH {epoch+1}/{num_epochs}] {_dump_metrics(train_metrics)}"
-                            ),
-                            advance=1,
-                        )
-
-                        if epoch % self.evaluate_every == 0:
-                            self.run_evaluation(session)
-
-            except KeyboardInterrupt:
-                pass
-
-        def run_epoch(self, session):
-            # Batch scan
-            # if batch_scan:
-            #     @nnx.scan(in_axes=0, out_axes=0)
-            #     def batch_scanner(xx, yy):
-            #         return self.train_step(xx, yy)
-            #     return batch_scanner(x, y)
-
+    def run_session(self, *args, num_epochs: int, **kwargs):
+        try:
             with (
-                session.enter_epoch() as epoch,
                 track.task(
-                    total=len(epoch),
-                    description="[BATCH] Preparing...",
+                    total=num_epochs,
+                    description="[EPOCH] Preparing...",
                 ) as trackbar,
+                self.trainer.session(*args, **kwargs) as (training_set, evaluation_set),
             ):
 
                 trackbar.update(
-                    description=(f"[BATCH {1}/{len(epoch)}] Running..."),
+                    description=(f"[EPOCH {1}/{num_epochs}] Running..."),
                 )
 
-                epoch_metrics = []
-
-                for n, batch in enumerate(epoch):
-                    metrics = _run_batch(self.training, batch)
+                for epoch in range(num_epochs):
+                    train_metrics = self.run_training(training_set)
+                    eval_metrics = self.run_evaluation(evaluation_set)
 
                     trackbar.update(
                         description=(
-                            f"[BATCH {n+1}/{len(epoch)}] {_dump_metrics(metrics)}"
+                            f"[EPOCH {epoch+1}/{num_epochs}] {_dump_metrics(train_metrics)} {_dump_metrics(eval_metrics)}"
                         ),
                         advance=1,
                     )
 
-                    if not jnp.isfinite(metrics["loss"]):
-                        raise LossNonFiniteException(f"Loss is {metrics["loss"]}")
-
-                    epoch_metrics.append(metrics)
-
-                return tree.map(_reduce_epoch_metrics, *epoch_metrics)
-
-        def run_evaluation(self, session):
+        except KeyboardInterrupt:
             pass
 
-    def __call__(self, *args, **kwargs):
-        return self.trainer.run_session(*args, **kwargs)
+    def run_training(self, training_set: BatchedDataset):
+        # Batch scan
+        # if batch_scan:
+        #     @nnx.scan(in_axes=0, out_axes=0)
+        #     def batch_scanner(xx, yy):
+        #         return self.train_step(xx, yy)
+        #     return batch_scanner(x, y)
 
-    thread: Thread
+        with track.task(description="[TRAIN] Preparing...") as trackbar:
 
-    def start(self, *args, **kwargs):
-        """
-        Start the training process.
-        """
-        if hasattr(self, "thread"):
-            raise RuntimeError("Training is already running.")
-        self.thread = Thread(target=self, args=args, kwargs=kwargs)
-        self.thread.start()
+            self.trainer.train(training=True)
+            reset_state(self.trainer)
+
+            train_metrics = []
+
+            trackbar.update(
+                total=len(training_set),
+                description=(f"[TRAIN {0}/{len(training_set)}]"),
+            )
+
+            for n, batch in enumerate(training_set):
+                metrics = _run_training_batch(self.trainer, batch)
+
+                trackbar.update(
+                    description=(
+                        f"[TRAIN {n+1}/{len(training_set)}] {_dump_metrics(metrics)}"
+                    ),
+                    advance=1,
+                )
+
+                if not jnp.isfinite(metrics["loss"]):
+                    raise LossNonFiniteException(f"Loss is {metrics["loss"]}")
+
+                train_metrics.append(metrics)
+
+
+            train_metrics = tree.map(_reduce_epoch_metrics, *train_metrics)
+
+            if self.train_history is not None:
+                for k, v in train_metrics.items():
+                    self.train_history[k] = jnp.append(self.train_history[k], v, axis=0)
+            else:
+                self.train_history = train_metrics
+
+            return train_metrics
+
+    def run_evaluation(self, evaluation_set: BatchedDataset):
+        with track.task(description="[EVAL] Preparing...") as trackbar:
+            self.trainer.eval(training=False)
+            reset_state(self.trainer)
+
+            evaluation_metrics = []
+
+            trackbar.update(
+                total=len(evaluation_set),
+                description=(f"[EVAL {0}/{len(evaluation_set)}]"),
+            )
+
+            for n, batch in enumerate(evaluation_set):
+                metrics = _run_evaluation_batch(self.trainer, batch)
+
+                trackbar.update(
+                    description=(
+                        f"[EVAL {n+1}/{len(evaluation_set)}] {_dump_metrics(metrics)}"
+                    ),
+                    advance=1,
+                )
+
+                evaluation_metrics.append(metrics)
+
+            evaluation_metrics = tree.map(_reduce_epoch_metrics, *evaluation_metrics)
+
+            if self.eval_history is not None:
+                for k, v in evaluation_metrics.items():
+                    self.eval_history[k] = jnp.append(self.eval_history[k], v, axis=0)
+            else:
+                self.eval_history = evaluation_metrics
+
+            return evaluation_metrics
 
     def stop(self):
         """
         Stop the training process.
         """
-        if not hasattr(self, "thread"):
+        if self.thread is None:
             raise RuntimeError("Training is not running.")
         # signals to stop th thread
+        # self.
         self.thread.join()
-        del self.thread
+        self.thread = None
 
-    @property
-    def history(self):
-        return self.trainer.history
+    
 
+def _metric_path_to_str(path: flax_typing.PathParts):
+    return ".".join(str(part) for part in path)
+
+
+def _reduce_epoch_metrics(*values: list[jnp.ndarray]) -> jnp.ndarray:
+    return jnp.mean(jnp.array(values))[None, ...]
 
 def _dump_metrics(metrics: dict[str, jnp.ndarray]):
     metrics = tree.map(jnp.mean, metrics)
     return " ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
 
 
-def fit[M: Model](model: M) -> Fit[M]:
+def fit(model: Model) -> Training:
     """
     Transforma el modelo es un objeto entrenable
     """
-    return Fit(model)
+    return Training(model.Trainer(model, model.settings.trainer)) # type: ignore
 
 
 @nnx.jit
-def _run_batch(
-    training: Model.Training,
+def _run_training_batch(
+    trainer: Model.Trainer,
     batch,
 ) -> dict[str, jnp.ndarray]:
 
-    # batch = training.session.prepare_batch(batch)
+    def train(trainer):
+        trainer.train_fn(batch)
 
-    def loss_fn(training):
-        loss, metrics = training(batch)
-        metrics["loss"] = loss
+        metrics = nnx.pop(trainer, Metric).flat_state()
+
+        loss = sum(
+            jnp.mean(loss.value)
+            for loss in metrics.values()
+            if issubclass(loss.type, Loss)
+        )
+
+        metrics = {_metric_path_to_str(k): v.value for k, v in metrics.items()}
+        metrics = {"loss": loss, **metrics}
+
         loss = jnp.nan_to_num(loss, nan=0, posinf=0, neginf=0)
         return loss, metrics
 
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (_, metrics), grad = grad_fn(training)
+    grad_fn = nnx.value_and_grad(train, has_aux=True)
+    (_, metrics), grad = grad_fn(trainer)
 
-    training.optimizer.update(grad)
+    trainer.optimizer.update(grad)
 
     return metrics
 
 
-def _reduce_epoch_metrics(*values: list[jnp.ndarray]) -> jnp.ndarray:
-    return jnp.mean(jnp.array(values))[None]
+@nnx.jit
+def _run_evaluation_batch(
+    trainer: Model.Trainer,
+    batch,
+) -> dict[str, jnp.ndarray]:
+    # batch = training.session.prepare_batch(batch)
+
+    trainer.eval_fn(batch)
+    metrics = nnx.pop(trainer, Metric).flat_state()
+    metrics = {_metric_path_to_str(k): v.value for k, v in metrics.items()}
+    return metrics
+
 
 
 # %%

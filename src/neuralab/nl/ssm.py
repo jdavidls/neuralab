@@ -25,7 +25,7 @@ Note: B, C are input-dependent (selective) while A, D are static parameters
 """
 
 # %%
-from typing import Annotated, Callable
+from typing import Annotated, Callable, Optional
 
 from einops import einsum, rearrange, repeat
 from flax import nnx, struct
@@ -33,8 +33,8 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
+from neuralab.nl.common import State
 from neuralab.nl.norm import RMSNorm
-
 
 
 class SSM(nnx.Module):
@@ -73,6 +73,8 @@ class SSM(nnx.Module):
         ## https://github.com/vvvm23/mamba-jax/blob/main/mamba_jax/modelling/equinox/blocks.py#L95
         self.dt_proj = nnx.Linear(dt_rank, features, use_bias=True, rngs=rngs)
 
+        self.state = State(None)
+
     def __call__(self, u: Float[Array, "T ... H"]) -> Float[Array, "T ... H"]:
         """Runs the SSM. See:
             - Algorithm 2 in Section 3.2 in the Mamba paper [1]
@@ -106,7 +108,8 @@ class SSM(nnx.Module):
         D = self.D.value
 
         # This is similar to run_SSM(A, B, C, u) in The Annotated S4 [2]
-        y = selective_scan(u, Δ, A, B, C, D)
+        state, y = selective_scan(u, Δ, A, B, C, D, self.state.value)
+        self.state = State(state)
 
         return y
 
@@ -194,9 +197,9 @@ class Mamba(nnx.Module):
         (x, res) = jnp.split(x, 2, axis=-1)  # shape (l, ..., 2 * f)
 
         if self.settings.use_convolution:
-            x = rearrange(x, 't ... f -> ... t f')
+            x = rearrange(x, "t ... f -> ... t f")
             x = self.conv(x)
-            x = rearrange(x, '... t f -> t ... f')
+            x = rearrange(x, "... t f -> t ... f")
 
         x = self.settings.activation(x)
 
@@ -212,25 +215,16 @@ class Mamba(nnx.Module):
         return self.norm(output)
 
 
-if __name__ == "__main__":
-    rngs = nnx.Rngs(1)
-    ssm = SSM(2, 4, 8, rngs=rngs)
-    x = jnp.ones((100, 16, 2))
-    y = ssm(x)
-
-    mamba = Mamba(Mamba.Settings(16), rngs=rngs)
-    x = jnp.ones((100, 16, 16))
-    y = mamba(x)
-    
-
 def selective_scan(
     u: Float[Array, "l ... h"],
     dt: Float[Array, "l ... h"],
     A: Float[Array, "n n"],
     B: Float[Array, "n h"],
     C: Float[Array, "h n"],
-    D: float | Float[Array, "h"] = 1.,
+    D: float | Float[Array, "h"] = 1.0,
+    x_0: Optional[Float[Array, "n"]] = None,
     dt_limits=(0.001, 0.1),
+    use_selective_scan=False,
 ):
     """Selective SSM scan with proper gating mechanism.
 
@@ -256,34 +250,40 @@ def selective_scan(
     ΔA = jnp.exp(einsum(dt, A, "l ... d, d n -> l ... d n"))
     ΔB_u = einsum(dt, B, u, "l ... d, l ... n, l ... d -> l ... d n")
 
+    # Initialize state
+    if x_0 is None:
+        x_0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
+
     # Selective scan with state handling
-    if False:
-        @nnx.scan
-        def selective_scan_step(carry, inputs):
-            x_t_1 = carry
-            ΔA_t, ΔB_u_t, C_t = inputs
+    # if use_selective_scan:
+    #     def selective_scan_step(s, c):
+    #         return c[0] * s[0], c[0] * s[1] + c[1]
 
-            # State update
-            x_t = ΔA_t * x_t_1 + ΔB_u_t
+    #     # Run scan
+    #     _, x = lax.associative_scan(selective_scan_step, (ΔA, ΔB_u))
+    # else:
+    @nnx.scan
+    def selective_scan_step(x_t_1, inputs):
+        ΔA_t, ΔB_u_t = inputs
+        # State update
+        x_t = ΔA_t * x_t_1 + ΔB_u_t
+        return x_t, x_t
 
-            # Output projection
-            y_t = einsum(C_t, x_t, "... n, ... d n -> ... d")
-
-            return x_t, y_t
-
-        # Initialize state
-        x0 = jnp.zeros(batch_shape + ΔA.shape[-2:])
-
-        # Run scan
-        _, y = selective_scan_step(x0, (ΔA, ΔB_u, C))
-    else:
-        def selective_scan_step(s, c):
-            return c[0] * s[0], c[0] * s[1] + c[1]
-
-        # Run scan
-        _, x = lax.associative_scan(selective_scan_step, (ΔA, ΔB_u))
-        y = einsum(C, x, "... n, ... d n -> ... d")
-        
+    # Run scan
+    x_z, x = selective_scan_step(x_0, (ΔA, ΔB_u))
+    
+    y = einsum(C, x, "... n, ... d n -> ... d")
 
     # Skip connection
-    return y + u * D
+    return x_z, y + u * D
+
+
+if __name__ == "__main__":
+    rngs = nnx.Rngs(1)
+    ssm = SSM(2, 4, 8, rngs=rngs)
+    x = jnp.ones((100, 16, 2))
+    y = ssm(x)
+
+    mamba = Mamba(Mamba.Settings(16), rngs=rngs)
+    x = jnp.ones((100, 16, 16))
+    y = mamba(x)

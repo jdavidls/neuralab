@@ -9,7 +9,7 @@ from jax import numpy as jnp
 from neuralab import nl
 from neuralab.trading.dataset import Dataset
 from neuralab.trading.ground_truth import GroundTruth
-from neuralab.trading.model.base_model import TradingModel
+from neuralab.trading.model.trading_model import TradingModel
 from neuralab.trading.trainer import Labels
 
 

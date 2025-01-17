@@ -159,16 +159,13 @@ class EMStats(nnx.Module):
             nnx.Param(log_decay_init) if learn else nnx.Cache(log_decay_init)
         )
 
-        self.state: State[Optional[Float[Array, "... num_layers"]]] = State(None)
+        self.ema_state: State[Optional[Float[Array, "... num_layers"]]] = State(None)
+        self.emv_state: State[Optional[Float[Array, "... num_layers"]]] = State(None)
 
     @property
     def decay(self):
         """Returns the sigmoid-transformed decay values."""
         return nn.sigmoid(self.log_decay.value) * self.scale + self.min_t
-
-    def reset(self):
-        """Resets the internal EMA state."""
-        self.state.value = None
 
     def ema(self, x):
         """Computes EMAs for the given input.
@@ -180,14 +177,15 @@ class EMStats(nnx.Module):
             Array of computed EMAs.
         """
 
-        ema_init = self.state.value
+        ema_init = self.ema_state.value
         if ema_init is None:
             ema_init = np.mean(x[: self.max_t // 2], axis=0)
             ema_init = repeat(ema_init, "... -> ... l", l=self.num_layers)
 
         ema_x = ema_fn(x, self.decay, ema_init=ema_init)
-        # if self.training is False:
-        # self.state.value = ema_x[-1]
+
+        self.ema_state = State(ema_x[-1])
+
         return ema_x
 
     def emav(self, x):
@@ -199,26 +197,21 @@ class EMStats(nnx.Module):
         Returns:
             Tuple containing the EMA and EMV.
         """
-        # x2 = np.square(x)
-        # emas = self(np.stack([x, x2], axis=1))
-        # ema, ema_x2 = emas[:, 0], emas[:, 1]
-        
-        ema_init = np.mean(x[: self.max_t // 2], axis=0)
-        ema_init = repeat(ema_init, "... -> ... l", l=self.num_layers)
+        ema_init = self.ema_state.value
+        if ema_init is None:
 
-        emv_init = np.var(x[: self.max_t // 2], axis=0)
-        emv_init = repeat(emv_init, "... -> ... l", l=self.num_layers)
+            ema_init = np.mean(x[: self.max_t // 2], axis=0)
+            ema_init = repeat(ema_init, "... -> ... l", l=self.num_layers)
+
+        emv_init = self.emv_state.value
+        if emv_init is None:
+            emv_init = np.var(x[: self.max_t // 2], axis=0)
+            emv_init = repeat(emv_init, "... -> ... l", l=self.num_layers)
 
         ema, emv = emav_fn(x, self.decay, ema_init=ema_init, emv_init=emv_init)
-        
-        # x2 = np.square(x)
-        
-        # emas = self(np.stack([x, x2], axis=1))
-        # ema, ema_x2 = emas[:, 0], emas[:, 1]
 
-
-        # Exponential moving variance
-        #emv = (ema2 - ema**2) #*  2 / (decay + 1)
+        self.ema_state = State(ema[-1])
+        self.emv_state = State(emv[-1])
 
         return ema, emv
 

@@ -9,10 +9,11 @@ from jax import numpy as jnp
 import optax
 
 from neuralab import fn, nl
+from neuralab.nl.common import State
 from neuralab.trading.dataset import Dataset
 
 from neuralab.trading.ground_truth import GroundTruth
-from neuralab.trading.model.base_model import TradingModel
+from neuralab.trading.model.trading_model import TradingModel
 from neuralab.trading.trainer import Labels
 
 
@@ -44,12 +45,8 @@ class H0(TradingModel):
             return (
                 +self.num_in_timeseries * self.num_ema_layers  # normalized features
                 + self.num_in_timeseries * self.num_ema_layers  # batch normalized vars
-                + fn.diff_matrix_num_outputs(
-                    self.num_ema_layers
-                )  # price diff matrix
-                + fn.diff_matrix_num_outputs(
-                    self.num_ema_layers
-                )  # volume diff matrix
+                + fn.diff_matrix_num_outputs(self.num_ema_layers)  # price diff matrix
+                + fn.diff_matrix_num_outputs(self.num_ema_layers)  # volume diff matrix
                 + fn.diff_matrix_num_outputs(
                     2 * self.num_ema_layers
                 )  # imbalance diff matrix
@@ -63,6 +60,7 @@ class H0(TradingModel):
         num_features = 64
         num_out_logits = 3
 
+    settings: Settings
 
     def __init__(
         self,
@@ -79,22 +77,11 @@ class H0(TradingModel):
 
         self.feed_norm = nnx.BatchNorm(settings.num_feed_features, rngs=rngs)
 
-
-        if False:
-            self.feat_proj = nl.FeedForward(
-                settings.num_feed_features,
-                settings.num_features * 2,
-                settings.num_features,
-                residual=False,
-                rngs=rngs,
-            )
-        else:
-            self.feat_proj = nnx.Linear(
-                settings.num_feed_features,
-                settings.num_features,
-                rngs=rngs,
-            )
-
+        self.feat_proj = nnx.Linear(
+            settings.num_feed_features,
+            settings.num_features,
+            rngs=rngs,
+        )
 
         # self.feat_proj = nl.TriactForward(
         #     settings.num_feed_features, settings.num_features, rngs=rngs
@@ -106,25 +93,16 @@ class H0(TradingModel):
             # nl.FeedForward(settings.num_features, 2.0, rngs=rngs),
         )
 
-        if False:
-            self.logits_proj = nl.FeedForward(
-                settings.num_features,
-                2.,
-                len(settings.training.head_losses) * 3,
-                residual=False,
-                normalization=False,
-                rngs=rngs,
-            )
-        else:
-            self.logits_proj = nnx.Linear(
-                settings.num_features,
-                len(settings.training.head_losses) * 3,
-                rngs=rngs,
-            )
+        self.logits_proj = nnx.Linear(
+            settings.num_features,
+            len(settings.head_losses) * 3,
+            rngs=rngs,
+        )
 
         self.feed = nnx.Cache(None)
         self.feat = nnx.Cache(None)
 
+    @nnx.jit()
     def __call__(self, dataset: Dataset):
         x = dataset.timeseries(
             *self.settings.in_timeseries, axis=-1
@@ -157,7 +135,7 @@ class H0(TradingModel):
         # Logits
         logits = self.logits_proj(feat)
 
-        return rearrange(logits, "t b m (h f) -> t b m h f", h=self.settings.training.num_heads)
+        return rearrange(logits, "t b m (h f) -> t b m h f", h=self.settings.num_heads)
 
 
 if __name__ == "__main__":
@@ -166,47 +144,50 @@ if __name__ == "__main__":
     # jax.config.update("jax_debug_nans", True)
     model = H0(
         settings=H0.Settings(
-            training=H0.Training.Settings(
-                optimizer=optax.adam(1e-3),
+            trainer=H0.Trainer.Settings(
+                optimizer=optax.adam(1e-2),
             )
         )
     )
-    model.training
+    
+    # %%
 
-    with open('model.pkl', 'rb') as f:
+    with open("model.pkl", "rb") as f:
         state = pickle.load(f)
+        del state["training"]
+        del state["ema"]["state"]
+        state["ema"]["ema_state"] = nnx.VariableState(type=State, value=None)
+        state["ema"]["emv_state"] = nnx.VariableState(type=State, value=None)
+        state["layers"]["layers"][0]["ssm"]["state"] = nnx.VariableState(
+            type=State, value=None
+        )
 
     graph, _ = nnx.split(model)
     model = nnx.merge(graph, state)
-    #%%
-    
 
+    # %%
+    dataset = Dataset.Ref.of("2021 to 2023 1m").fetch()
     trainer = nl.fit(model)
+    trainer(dataset, num_epochs=1000)
 
-    dataset = Dataset.Ref.of("2021 1m").fetch()
-    # with jax.checking_leaks():
-    #%%
-    trainer.start(dataset, num_epochs=1000)
+    # %% evaluation
+    evaluation_set = Dataset.Ref.of("2023 1m").fetch()
 
-    #%% evaluation
-    evaluation_set = Dataset.Ref.of("2024 1m").fetch()
+    # %%
 
-    #%%
-
-
-    #%%
+    # %%
     from neuralab.trading.evaluation import evaluate
-  
-    @nnx.jit()
+
+    # @nnx.jit()
     def eval_perf(model, dataset):
         logits = model(dataset)
-        return evaluate(logits[..., 1, :], dataset).total_performance
-    
-    perf = jnp.array([eval_perf(model, batch) for batch in evaluation_set.batch_iter(2048)])
-    
-    #%%
-    
-        
+        return evaluate(logits[..., 0, :], dataset).total_performance
+
+    perf = jnp.array(
+        [eval_perf(model, batch) for batch in evaluation_set.batched(2048)]
+    )
+
+    # %%
 
     ev_set = evaluation_set[20000:22048]
     logits = model(ev_set)[..., 1, :]
@@ -214,11 +195,12 @@ if __name__ == "__main__":
 
     price = ev_set.log_price[:, 0, 0]
 
-    plt.plot((price - jnp.min(price)) / (jnp.max(price) - jnp.min(price)), color='green')
-    plt.pcolormesh(rearrange(nnx.softmax(logits[:, 0,0]), "t p -> 1 t p"))
+    plt.plot(
+        (price - jnp.min(price)) / (jnp.max(price) - jnp.min(price)), color="green"
+    )
+    plt.pcolormesh(rearrange(nnx.softmax(logits[:, 0, 0]), "t p -> 1 t p"))
     plt.colorbar()
     plt.show()
-
 
     # %% Surgery
 
@@ -231,7 +213,7 @@ if __name__ == "__main__":
     from neuralab.trading.ground_truth import GroundTruth
 
     ground_truth = GroundTruth.from_dataset(
-        dataset, model.settings.training.ground_truth
+        dataset, model.settings.trainer.ground_truth
     )
     sli = slice(0, 1000)
     labels = ground_truth.labels[sli]

@@ -15,6 +15,7 @@ from jaxtyping import Array, Float
 from pandas import DataFrame
 from typer import Argument, Option, Typer
 
+from neuralab.nl.model import BaseDataset, BatchedDataset
 from neuralab.resource import Resource, fetch_tree
 from neuralab.trading.dataframe import TradeSampleDataFrame
 from neuralab.trading.knowledge import (
@@ -25,8 +26,8 @@ from neuralab.trading.knowledge import (
     MarketSet,
     SymbolSet,
 )
-from neuralab.utils.base_dataset import BaseDataset, BatchIterable
-from neuralab.utils.timeutils import TimeRange
+
+from time_range import TimeRange
 
 
 @struct.dataclass
@@ -170,28 +171,18 @@ class Dataset(Resource, BaseDataset):
         assert self.logits is not None
         return jnp.sign(self.logits)
 
-    @property
-    def shape(self):
-        return self.log_price.shape
-
-    def __len__(self):
-        return len(self.log_price)
-
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
 
-    def __getitem__(self, *args) -> Self:
-        return tree.map(lambda v: v.__getitem__(*args), self)
 
     def timeseries(self, *feature_names: Feature, axis=-1):
         return jnp.stack(
             [getattr(self, feature) for feature in feature_names], axis=axis
         )
 
-    def batch_iter(self, batch_size: int) -> BatchIterable[Dataset]:
-        return BatchIterable(self, batch_size)
-
+    def batched(self, batch_size: int) -> BatchedDataset[Dataset]:
+        return BatchedDataset(self, batch_size)
 
     @staticmethod
     def concat(datasets: list[Dataset], axis=1) -> Dataset:
